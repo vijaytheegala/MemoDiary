@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+google-genai
+python-dotenv
+pydantic
+edge-tts
+gunicorn
+python-multipart
+requests
