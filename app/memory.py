@@ -13,6 +13,7 @@ env_path = Path(__file__).parent.parent / ".env"
 load_dotenv(dotenv_path=env_path)
 
 from app.storage import storage
+from app.key_manager import key_manager
 
 def safe_print(text: str):
     """Utility to print UTF-8 text safely on Windows consoles."""
@@ -22,66 +23,78 @@ def safe_print(text: str):
         print(text.encode('ascii', 'replace').decode('ascii'))
 
 MEMORY_EXTRACTION_PROMPT = """
-You are a Memory Extractor. Your goal is to identify and extract key facts about the user's life, preferences, relationships, and major events from their diary entries.
+You are a Memory Extractor. Your goal is to identify and extract key facts and structured metadata from the user's input for a long-term memory database.
 
-Rules:
-1. Extract FACTS only. Do not summarize the mood unless it's a major event or strong emotion.
-2. Focus on:
-   - **People**: Names and their relationship to user (e.g., "Sarah (friend)").
-   - **Events**: Specific occurrences, meetings, celebrations.
-   - **Places**: Locations visited or mentioned.
-   - **Emotions**: Strong, non-transient feelings attached to events (e.g., "Felt grief about dog").
-   - **Objects**: Important items mentioned (e.g., "Bought a new car", "lost my keys").
-   - **Dates/Times**: "Birthday", "Anniversary", specific dates mentioned.
-   - **Preferences**: Likes/dislikes.
-3. Ignore transient, small talk ("I am sad today" without context), but capture "I am sad because X".
-4. If no permanent facts are found, return valid JSON with empty list.
+**CORE ODJECTIVE:**
+From every input, intelligently extract and store meaningful keywords and entities such as people names, events, objects, emotions, dates, and contexts.
 
-Input Format: User diary entry text.
-Output Format: JSON only.
+**EXTRACTION RULES:**
+1. **Facts**: Extract explicit facts.
+   - **People**: Names (e.g., "Kunal", "Mom").
+   - **Events**: "Trip to Goa", "Birthday party", "Meeting".
+   - **Objects**: "PS5", "Car", "Gift", "Wallet".
+   - **Emotions**: "Happy", "Anxious", "Excited".
+   - **Dates/Time**: "2025", "January", "Yesterday".
+2. **Context**: Ignore filler words ("I think", "maybe"). Focus on the core information.
+
+**METADATA FIELDS:**
+You MUST classify the entry with these fields:
+- **event_type**: Choose ONE: [birthday, interview, travel, health, work, relationship, education, purchase, general_observation].
+- **topics**: A list of **NORMALIZED KEYWORDS/TAGS**. These should be single words or short phrases suitable for search indexing (e.g., "ps5", "kunal", "goa", "gift").
+- **importance**: [normal, emotional, milestone].
+
+**OUTPUT FORMAT (JSON ONLY):**
 {
+  "event_type": "purchase",
+  "topics": ["ps5", "gaming", "sony", "gift"],
+  "importance": "normal",
   "facts": [
-    {"type": "person", "content": "Sarah (friend)"},
-    {"type": "event", "content": "Went to Starbucks"},
-    {"type": "preference", "content": "Hates coffee"}
+    {"type": "object", "content": "User bought a PS5"},
+    {"type": "person", "content": "Kunal (friend)"},
+    {"type": "date", "content": "2025-01-01"}
   ]
 }
 
-Example:
-Input: "I went to Starbucks with Sarah today. She ordered a latte. I hate coffee though. Also, bought a nice pen."
-Output: {
+**EXAMPLES:**
+Input: "I bought a PS5 for Kunal's birthday."
+Output:
+{
+  "event_type": "purchase",
+  "topics": ["ps5", "kunal", "birthday", "gift"],
+  "importance": "normal",
   "facts": [
-    {"type": "event", "content": "User went to Starbucks with Sarah"},
-    {"type": "person", "content": "Sarah"},
-    {"type": "preference", "content": "User hates coffee"},
-    {"type": "object", "content": "User bought a nice pen"}
+    {"type": "object", "content": "User bought a PS5"},
+    {"type": "person", "content": "Kunal"},
+    {"type": "event", "content": "Kunal's Birthday"}
   ]
 }
 """
 
 class MemoryProcessor:
     def __init__(self):
-        self.api_key = os.getenv("GEMINI_API_KEY")
-        self.client = None
-        if self.api_key:
-            self.client = genai.Client(
-                api_key=self.api_key,
-                http_options={'api_version': 'v1alpha'}
-            )
+        pass
+
+    def _get_client(self):
+        key = key_manager.get_next_key()
+        if key:
+            # UPGRADE: Standardization on 2.0 Flash (v1alpha) for consistent behavior
+            return genai.Client(api_key=key, http_options={'api_version': 'v1alpha'})
+        return None
 
     async def process_entry(self, session_id: str, text: str, entry_id: int):
         """
         Background task to extract facts and save them to the database.
         """
-        if not self.client or not entry_id:
+        client = self._get_client()
+        if not client or not entry_id:
             return
 
         try:
             safe_print(f"DEBUG: Processing memory for: {text[:30]}...")
             
-            # Using Gemini for Extraction
-            response = await self.client.aio.models.generate_content(
-                model="gemini-2.0-flash-exp",
+            # UPGRADE: 2.0 Flash for accurate extraction
+            response = await client.aio.models.generate_content(
+                model="gemini-2.0-flash",
                 contents=text,
                 config=types.GenerateContentConfig(
                     system_instruction=MEMORY_EXTRACTION_PROMPT,
@@ -92,10 +105,19 @@ class MemoryProcessor:
             
             text_res = response.text.strip()
             data = json.loads(text_res)
+            
+            # Save Metadata
+            e_type = data.get("event_type", "general_observation")
+            topics = data.get("topics", [])
+            importance = data.get("importance", "normal")
+            
+            storage.update_entry_metadata(entry_id, event_type=e_type, topics=topics, importance=importance)
+            
+            # Save Facts
             facts = data.get("facts", [])
             
             if facts:
-                safe_print(f"🧠 EXTRACTED MEMORIES: {facts}")
+                safe_print(f"🧠 EXTRACTED MEMORIES ({e_type}, {importance}): {facts}")
                 for fact in facts:
                     # fact is now a dict: {"type": "...", "content": "..."}
                     f_type = fact.get("type", "detail")

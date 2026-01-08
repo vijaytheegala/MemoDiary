@@ -28,5 +28,5 @@ class TTSEngine:
         await communicate.save(output_path)
 
 # Initialize a global TTS engine
-# Aria is very balanced: friendly, sweet, and professional.
-tts_engine = TTSEngine(voice="en-US-AriaNeural")
+# Jenny is often considered more conversational/warm than Aria.
+tts_engine = TTSEngine(voice="en-US-JennyNeural")

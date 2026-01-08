@@ -15,6 +15,7 @@ import traceback
 from app.session import get_session_history, add_message_to_session
 from app.ai import get_ai_response
 from app.utils.tts_engine import tts_engine
+from app.middleware.rate_limiter import chat_limiter # Restored import
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 import io
@@ -62,6 +63,14 @@ app.add_middleware(
 # Serve static files (Frontend)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
+@app.get("/")
+async def root():
+    return FileResponse("static/index.html")
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    return FileResponse("static/favicon.png")
+
 @app.get("/health")
 async def health_check():
     """Simple health check endpoint."""
@@ -69,131 +78,29 @@ async def health_check():
 
 from typing import Optional
 
+# --- Models ---
 class ChatRequest(BaseModel):
     session_id: Optional[str] = Field(None) 
     message: str = Field(..., min_length=1, max_length=2000)
-
-class TTSRequest(BaseModel):
-    text: str = Field(..., min_length=1, max_length=1000)
-    session_id: Optional[str] = Field(None)
+    stream: bool = True # Default to True for new experience
 
 class ChatResponse(BaseModel):
     response: str
     mood: str
     new_session_id: Optional[str] = None
 
-class AuthResponse(BaseModel):
-    session_id: str
-    status: str
-
+# --- Helpers ---
 def generate_secure_id():
-    return secrets.token_urlsafe(12)
+    """Generates a secure, random user ID."""
+    return f"u_{secrets.token_urlsafe(16)}"
 
-from app.middleware.rate_limiter import chat_limiter, auth_limiter, tts_limiter
 
-@app.post("/api/auth/anonymous", response_model=AuthResponse)
-async def anonymous_auth(request: Request):
-    """
-    Generates a unique, secure anonymous user ID and initializes a session.
-    """
-    client_ip = request.client.host
-    if not auth_limiter.is_allowed(client_ip):
-        raise HTTPException(status_code=429, detail="TOO_MANY_REQUESTS")
-
-    try:
-        # Generate a secure ID
-        session_id = generate_secure_id()
-        # Initialize in storage
-        from app.storage import storage
-        storage.create_user(session_id)
-        
-        logger.info(f"Created new anonymous user: {session_id}")
-        return AuthResponse(session_id=session_id, status="ready")
-    except Exception as e:
-        logger.error(f"Auth Error: {e}")
-        raise HTTPException(status_code=500, detail="AUTH_ERROR")
-
-class StartupRequest(BaseModel):
-    session_id: Optional[str] = Field(None)
-
-@app.post("/api/startup")
-async def startup(request: Request, startup_req: StartupRequest):
-    """
-    Handles app startup/refresh.
-    Returns: session_id (existing or new) + Welcome Message.
-    """
-    session_id = startup_req.session_id
-    
-    # Rate limit check (using IP if no session yet)
-    limit_key = session_id if (session_id and session_id != "null") else request.client.host
-    if not auth_limiter.is_allowed(limit_key):
-        raise HTTPException(status_code=429, detail="TOO_MANY_REQUESTS")
-
-    # 1. Validate / Generate Session ID
-    if not session_id or session_id == "null" or len(session_id) < 5:
-        session_id = generate_secure_id()
-        # Initialize in storage logic handled by ai.get_welcome_message if needed, 
-        # but let's ensure it exists here to be safe.
-        from app.storage import storage
-        storage.create_user(session_id)
-        logger.info(f"Generated new session ID at startup: {session_id}")
-
-    try:
-        # 2. Get Welcome Message
-        from app.ai import get_welcome_message
-        msg, mood = await get_welcome_message(session_id)
-        
-        return {
-            "session_id": session_id,
-            "message": msg,
-            "mood": mood
-        }
-    except Exception as e:
-        logger.error(f"Startup Error: {e}")
-        raise HTTPException(status_code=500, detail="STARTUP_ERROR")
-
-@app.post("/api/tts") # Switched from GET for privacy
-async def get_tts(request: Request, tts_req: TTSRequest):
-    """
-    Generates and returns an audio stream for the given text.
-    """
-    session_id = tts_req.session_id
-    text = tts_req.text
-
-    if not tts_limiter.is_allowed(session_id or request.client.host):
-        raise HTTPException(status_code=429, detail="TOO_MANY_REQUESTS")
-
-    try:
-        if not text:
-            raise HTTPException(status_code=400, detail="Text is required")
-        
-        if len(text) > 1000:
-            raise HTTPException(status_code=400, detail="Text too long")
-        
-        # Streaming response directly specific to edge_tts generator
-        return StreamingResponse(
-            tts_engine.generate_speech_stream(text), 
-            media_type="audio/mpeg"
-        )
-    except HTTPException as he:
-        raise he
-    except Exception as e:
-        logger.error(f"TTS Error: {e}")
-        # Sanitize error detail
-        raise HTTPException(status_code=500, detail="TTS_ERROR")
-
-@app.get("/")
-async def read_root():
-    """Serve the main chat interface."""
-    return FileResponse(os.path.join("static", "index.html"))
-
-@app.post("/api/chat", response_model=ChatResponse)
+@app.post("/api/chat")
 async def chat(request: Request, chat_req: ChatRequest):
     session_id = chat_req.session_id
     user_message = chat_req.message
 
     # Rate limiting
-    # Use client IP if session_id is missing or 'null' string
     limit_key = session_id if (session_id and session_id != "null") else request.client.host
     if not chat_limiter.is_allowed(limit_key):
         raise HTTPException(status_code=429, detail="TOO_MANY_REQUESTS")
@@ -201,36 +108,137 @@ async def chat(request: Request, chat_req: ChatRequest):
     try:
         new_id_generated = None
         
-        # 0. Generate SECURE ID if missing or invalid pattern
-        # Treat string "null" from JS localStorage as invalid
+        # 0. Generate SECURE ID if missing
         if not session_id or session_id == "null" or len(session_id) < 5:
             session_id = generate_secure_id()
             new_id_generated = session_id
             logger.info(f"Generated new secure session ID: {session_id}")
-            # Initialize user in storage
             from app.storage import storage
             storage.create_user(session_id)
 
-        # 1. Retrieve history (scoped to session)
+        # 1. Retrieve history
         history = get_session_history(session_id)
 
-        # 2. Get AI Response
-        ai_text, mood = await get_ai_response(session_id, history, user_message)
-
-        # 3. Update In-Memory Session History
+        # 2. Add User Msg to History (In-Memory)
         add_message_to_session(session_id, "user", user_message)
-        add_message_to_session(session_id, "assistant", ai_text)
-        
-        return ChatResponse(response=ai_text, mood=mood, new_session_id=new_id_generated)
+
+        # 3. Stream or Block
+        if chat_req.stream:
+            async def event_generator():
+                # Send Session ID first if new
+                if new_id_generated:
+                    yield f"event: session_id\ndata: {new_id_generated}\n\n"
+                
+                # Get the stream generator from AI
+                ai_stream = await get_ai_response(session_id, history, user_message, stream=True)
+                
+                full_response = ""
+                async for chunk in ai_stream:
+                    if chunk:
+                        full_response += chunk
+                        # Escape newlines for SSE data payload logic if needed, 
+                        # but standard event stream handles it if we are careful.
+                        # Using JSON data payload is safer.
+                        yield f"data: {chunk}\n\n"
+                
+                # Update Session History with full response
+                if full_response:
+                    add_message_to_session(session_id, "assistant", full_response)
+                
+                # Send 'done' event? or close.
+                yield "event: done\ndata: [DONE]\n\n"
+
+            return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+        else:
+             # Standard JSON fallback
+            ai_text, mood = await get_ai_response(session_id, history, user_message, stream=False)
+            add_message_to_session(session_id, "assistant", ai_text)
+            return ChatResponse(response=ai_text, mood=mood, new_session_id=new_id_generated)
 
     except HTTPException as he:
-        logger.warning(f"HTTP {he.status_code} for session {session_id}: {he.detail}")
+        logger.warning(f"HTTP {he.status_code}: {he.detail}")
         raise he
     except Exception as e:
-        logger.error(f"FATAL ERR for session {session_id}: {str(e)}")
-        logger.error(traceback.format_exc())
-        # Provide more detail in dev/debug, but stick to generic for now unless verified
+        logger.error(f"FATAL ERR: {str(e)}")
         raise HTTPException(status_code=500, detail=f"ERR_INTERNAL: {str(e)}")
+
+
+@app.api_route("/api/tts", methods=["GET", "POST"])
+async def text_to_speech(request: Request):
+    """
+    Streaming TTS Endpoint. 
+    Accepts 'text' and 'session_id' as query params (GET) or JSON body (POST).
+    """
+    try:
+        # 1. Parse Input
+        if request.method == "POST":
+            data = await request.json()
+            text = data.get("text")
+            session_id = data.get("session_id")
+        else:
+            text = request.query_params.get("text")
+            session_id = request.query_params.get("session_id")
+
+        if not text:
+            raise HTTPException(status_code=400, detail="Missing text")
+
+        # 2. Generate Audio Stream
+        # Use a generator to stream bytes
+        async def audio_streamer():
+            try:
+                async for chunk in tts_engine.generate_speech_stream(text):
+                    yield chunk
+            except Exception as e:
+                logger.error(f"TTS Stream Error: {e}")
+                # If headers already sent, we can't do much but close stream
+                return
+
+        return StreamingResponse(
+            audio_streamer(), 
+            media_type="audio/mpeg",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no" # Nginx
+            }
+        )
+
+    except Exception as e:
+        logger.error(f"TTS Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/startup")
+async def startup_check(request: Request):
+    """
+    Initial handshake. Returns a welcome message.
+    """
+    try:
+        data = await request.json()
+        session_id = data.get("session_id")
+        
+        # Logic similar to chat but simpler
+        if not session_id or session_id == "null":
+            session_id = generate_secure_id()
+            from app.storage import storage
+            storage.create_user(session_id)
+            
+            # Welcome new user
+            return {
+                "session_id": session_id,
+                "message": "Hello there. I'm Memo. What can I call you?",
+                "mood": "👋"
+            }
+        else:
+             # Returning user check?
+             # For now just ack
+             return {
+                 "session_id": session_id,
+                "message": "Welcome back.",
+                "mood": "👋"
+             }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 if __name__ == "__main__":
