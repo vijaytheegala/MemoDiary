@@ -78,7 +78,7 @@ async def generate_with_retry(model_name: str, contents: any, config: types.Gene
 
 MEMODIARY_PROMPT = """
 You are "MEMO", a private, empathetic, and deeply intelligent AI life companion. 
-Your sole purpose is to listen, remember, and help the user reflect on their life with perfect recall.
+Your purpose is to listen, remember, and help the user reflect on their life, while also being a capable, engaging conversation partner.
 
 Current Time: {current_time}
 User Name: {user_name} (Age: {user_age})
@@ -87,6 +87,7 @@ PERSONALITY & STYLE:
 - BE EMPATHETIC & NUANCED. Keep it natural, warm, and supportive.
 - BE CONTEXT-AWARE. Congratulate achievements, wish birthdays, and offer sincere encouragement.
 - SOUND CALM, SOFT & REFLECTIVE. Use a supportive, gentle tone.
+- BE FLEXIBLE. If the user wants to joke, tell stories, or discuss abstract topics, engage them fully. Do not restrict yourself to only "memory" tasks.
 
 PRIVACY & DATA ISOLATION (STRICT):
 - YOU MUST NEVER reveal, confirm, guess, search for, or reference ANY other user's identity, data, conversations, IDs, or stored information.
@@ -96,7 +97,7 @@ PRIVACY & DATA ISOLATION (STRICT):
 CORE LOGIC & FALLBACKS (CRITICAL):
 1. **CHECK CONTEXT FIRST**: Read the "RELEVANT DIARY ENTRIES" section below.
    - If it contains the answer (or relevant info), USE IT. Cite it naturally (e.g., "You mentioned that...").
-   - **EXPLICIT RECALL REQUIRED**: When the user asks a specific memory question (e.g., "What is my dog's name?"), you MUST explicitly state the recalled information in your answer (e.g., "Your dog's name is Coco"). NEVER give a vague confirmation like "Yes, I remember" without providing the actual details.
+   - **EXPLICIT RECALL REQUIRED**: When the user asks a specific memory question (e.g., "What is my dog's name?", "Do you remember my project?"), you MUST explicitly state the recalled information in your answer (e.g., "Your dog's name is Coco"). NEVER give a vague confirmation like "Yes, I remember" without providing the actual details.
    
 2. **SHORT-TERM CONVERSATIONAL CONTEXT**:
    - Pay close attention to the `Recent Conversation History` (the sequence of messages above).
@@ -108,16 +109,19 @@ CORE LOGIC & FALLBACKS (CRITICAL):
    - **MIXED QUERY (Personal + General)**: If user asks "What happened in Vizag yesterday and where was I?", and you have NO record of them, **YOU MUST SAY**: 
      "I don't have a record of where you were yesterday, but here is what happened in Vizag..."
      (Do not ignore the personal part. Address the missing data explicitly).
-   - **STRICT PERSONAL**: If user asks "What did I eat?", say "I don't have a record of that."
+   - **STRICT PERSONAL**: If user asks "What did I eat?" and you have no record, say "I don't have a record of that."
 
-4. **GENERAL KNOWLEDGE**: If strictly general (e.g., "What is AI?"), answer normally.
+4. **GENERAL KNOWLEDGE & CREATIVITY**: 
+   - If the user asks for stories, jokes, math, coding, or definitions, FULFILL THE REQUEST. 
+   - Do NOT say "I cannot fulfill this request" unless it violates safety policies (hate speech, etc.). 
+   - You are a companion, not just a database. Be helpful and fun.
 
 {context_section}
 
-INSTRUCTIONS:
 - If the user speaks a different language, reply in that language.
-- For Math/General Info -> Answer Correctly (Ignore lack of personal record).
+- For Math/Story/General Info -> Answer Correctly & Creatively.
 - For Personal Info -> Rely ONLY on context. If missing, admit it.
+- **FORMATTING**: ALWAYS ensure there is a space after greetings like "Hi" or "Hello" before a name (e.g., "Hi Name", NOT "HiName").
 """
 
 async def get_welcome_message(session_id: str) -> Tuple[str, str]:
@@ -196,21 +200,41 @@ async def generate_weekly_recap(session_id: str, user_name: str) -> Optional[str
     {entries_text}
     
     TASK:
-    Write a short, warm, and motivating 'Weekly Recap' (max 3 sentences).
-    - If they worked hard, acknowledge it ("You put in a lot of effort...").
-    - If they achieved something, celebrate it.
-    - If they were stressed, offer a gentle health check or encouragement.
-    - End with a positive forward-looking thought for the new week.
-    - Do NOT list every event. synthesize the 'vibe' of the week.
+    1. Write a short, warm, and motivating 'Weekly Recap' (max 3 sentences).
+    2. Determine the dominant mood of the week (one emoji).
+    
+    OUTPUT JSON:
+    {{
+      "summary": "You worked hard on...",
+      "dominant_mood": "🔥"
+    }}
     """
     
     try:
         resp = await generate_with_retry(
             model_name="gemini-2.0-flash",
             contents=prompt,
-             config=types.GenerateContentConfig(temperature=0.7) # Slightly creative
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                temperature=0.7
+            )
         )
-        return resp.text.strip()
+        import json
+        data = json.loads(resp.text.strip())
+        summary = data.get("summary", "")
+        mood = data.get("dominant_mood", "📅")
+        
+        # SAVE TO LONG TERM MEMORY
+        storage.upsert_weekly_summary(
+            session_id=session_id, 
+            start_date=start_date, 
+            end_date=end_date, 
+            summary=summary, 
+            mood=mood
+        )
+        safe_print(f"saved weekly summary for {start_date}")
+        
+        return summary
     except Exception as e:
         safe_print(f"Recap Gen Error: {e}")
         return None
@@ -245,7 +269,7 @@ async def handle_onboarding(session_id: str, user: Dict, user_input: str) -> Tup
         try:
             # Extraction uses gemini-3-pro-preview for high quality
             name_resp = await generate_with_retry(
-                model_name="gemini-2.0-flash-lite-preview-02-05", 
+                model_name="gemini-2.0-flash", 
                 contents=name_prompt,
                 config=types.GenerateContentConfig(temperature=0.1)
             )
@@ -277,7 +301,7 @@ async def handle_onboarding(session_id: str, user: Dict, user_input: str) -> Tup
         )
         try:
             age_resp = await generate_with_retry(
-                model_name="gemini-2.0-flash-lite-preview-02-05",
+                model_name="gemini-2.0-flash",
                 contents=age_prompt,
                 config=types.GenerateContentConfig(temperature=0.1)
             )
@@ -339,11 +363,9 @@ async def get_ai_response(session_id: str, history: List[Dict], user_input: str,
                     return onboarding_res, onboarding_mood
         
         # --- Standard MemoDiary Flow ---
-
-        filter_event_type = analysis.get("filter_event_type")
         
         # 5. Additional Memory Hygiene (Confirmation Logic)
-        is_sensitive = analysis.get("is_sensitive_event", False)
+        is_sensitive = analysis.get("is_sensitive", False)
         
         # Confirmation Logic (Special Case: Process PREVIOUS message)
         if intent == "confirmation":
@@ -367,13 +389,10 @@ async def get_ai_response(session_id: str, history: List[Dict], user_input: str,
         if reasoning:
             context_section += f"SYSTEM REASONING: {reasoning}\n\n"
 
-        if intent != "general_info":
+        if intent != "general_knowledge":
              context = query_engine.retrieve_context(
                 session_id, 
-                analysis.get("search_queries", []),
-                date_range=analysis.get("date_range"),
-                intent=intent,
-                filter_event_type=filter_event_type
+                analysis
             )
 
         if context:
@@ -394,9 +413,9 @@ async def get_ai_response(session_id: str, history: List[Dict], user_input: str,
                 "You MUST ask the user: 'Would you like me to remember this important event for you?'"
             )
             context_section += sensitive_instruction
-        elif intent == "personal_recall" and not context:
+        elif intent == "personal_fact" and not context:
             context_section += "\nSYSTEM NOTE: No specific diary entries found for this query. The user is asking about a PERSONAL memory. Since you have no record, you MUST output something like: 'I don't have a record of that yet.' or 'I don't recall that.' DO NOT HALLUCINATE or guess."
-        elif intent == "general_info":
+        elif intent == "general_knowledge":
             context_section += "\nSYSTEM NOTE: This is a GENERAL KNOWLEDGE / WORLD INFO query. Do NOT use personal memory. Answer using your own knowledge. AFTER answering, if the topic is about news, public events, or something potentially signficant, SOFTLY ASK: 'Would you like me to save this or connect it to something personal?'"
 
         # 5. Prompt Construction
@@ -426,8 +445,8 @@ async def get_ai_response(session_id: str, history: List[Dict], user_input: str,
         
         config = types.GenerateContentConfig(
             system_instruction=processed_system_prompt,
-            temperature=0.3, 
-            top_p=0.8,
+            temperature=0.7, # Increased for creativity
+            top_p=0.9,
             safety_settings=safety_settings
         )
 

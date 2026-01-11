@@ -3,6 +3,7 @@ import json
 import os
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Any
+from functools import lru_cache
 
 from contextlib import contextmanager
 
@@ -14,6 +15,9 @@ class DiaryStorage:
     def __init__(self, db_path: str = DB_PATH):
         self.db_path = db_path
         self._init_db()
+        # Simple RAM Cache
+        self._memory_cache = {} 
+        self._summary_cache = {}
 
     @contextmanager
     def _get_db(self):
@@ -34,6 +38,12 @@ class DiaryStorage:
             
             # Enable Write-Ahead Logging for concurrency (Optimization #1)
             cursor.execute('PRAGMA journal_mode=WAL;')
+            # Optimization #2: Reduce disk syncs (safe for non-critical data)
+            cursor.execute('PRAGMA synchronous = NORMAL;') 
+            # Optimization #3: Increase cache size (approx 2MB)
+            cursor.execute('PRAGMA cache_size = -2000;')
+            # Optimization #4: Store temp tables in RAM
+            cursor.execute('PRAGMA temp_store = MEMORY;')
 
             # Table for raw entries (chat history)
             cursor.execute('''
@@ -69,7 +79,7 @@ class DiaryStorage:
                 except Exception as e:
                     pass # Log if needed
 
-            # NEW: Memory Optimization Columns
+            # NEW: Memory Optimization Columns (keeping for backward compatibility/metadata)
             if "event_type" not in columns:
                 try:
                     cursor.execute("ALTER TABLE entries ADD COLUMN event_type TEXT")
@@ -81,7 +91,8 @@ class DiaryStorage:
             # Create index for event_type AFTER columns exist
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_entries_event_type ON entries(session_id, event_type)')
 
-            # Table for extracted structured facts
+            # Table for extracted structured facts (Existing one, can be kept or ignored, but strict new rules require memory_index)
+            # keeping it so we don't break existing behavior if any, but we are moving to memory_index
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS extracted_facts (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -102,6 +113,88 @@ class DiaryStorage:
                     age TEXT,
                     onboarding_complete BOOLEAN DEFAULT 0,
                     created_at TEXT
+                )
+            ''')
+            
+            # --- NEW LAYER 2: Structured Memory Index ---
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS memory_index (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT,
+                    memory_type TEXT,     -- profile, pet, event, preference, work, education, health, location
+                    memory_key TEXT,      -- dog_name, job_title, birthday, etc.
+                    memory_value TEXT,    -- Bhima, Data Engineer, etc.
+                    source_entry_id INTEGER,
+                    confidence REAL,      -- 0.0 - 1.0
+                    last_updated TEXT,
+                    FOREIGN KEY (source_entry_id) REFERENCES entries (id)
+                )
+            ''')
+            
+            # Indexes for memory_index
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_memory_session_key ON memory_index(session_id, memory_key)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_memory_session_type ON memory_index(session_id, memory_type)')
+
+            # --- NEW LAYER 3: Date Intelligence ---
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS daily_summary (
+                    session_id TEXT,
+                    date TEXT,            -- YYYY-MM-DD
+                    summary TEXT,
+                    key_events TEXT,      -- JSON or text
+                    dominant_mood TEXT,
+                    PRIMARY KEY (session_id, date)
+                )
+            ''')
+            
+            # Indexes for daily_summary
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_daily_session_date ON daily_summary(session_id, date)')
+
+            # --- NEW LAYER 4: Topic Profiles (The "Current State") ---
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS topic_state (
+                    session_id TEXT,
+                    topic TEXT,           -- health, food, routine, work, preferences
+                    state TEXT,           -- Consolidated summary of this aspect
+                    last_updated TEXT,
+                    PRIMARY KEY (session_id, topic)
+                )
+            ''')
+
+            # --- NEW LAYER 5: Hierarchical Summaries (Rolling Memory) ---
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS weekly_summary (
+                    session_id TEXT,
+                    start_date TEXT,      -- YYYY-MM-DD (Monday)
+                    end_date TEXT,        -- YYYY-MM-DD (Sunday)
+                    summary TEXT,
+                    dominant_mood TEXT,
+                    PRIMARY KEY (session_id, start_date)
+                )
+            ''')
+
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS monthly_summary (
+                    session_id TEXT,
+                    month TEXT,           -- YYYY-MM
+                    summary TEXT,
+                    dominant_mood TEXT,
+                    PRIMARY KEY (session_id, month)
+                )
+            ''')
+
+            # Additional required index from instructions
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_entries_session_time ON entries(session_id, timestamp)')
+            
+            # --- NEW LAYER 6: Daily Metrics (Audit Compliance) ---
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS daily_metrics (
+                    session_id TEXT,
+                    date TEXT,            -- YYYY-MM-DD
+                    energy INTEGER,       -- 1-10
+                    stress INTEGER,       -- 1-10
+                    sleep INTEGER,        -- Hours or Quality 1-10
+                    PRIMARY KEY (session_id, date)
                 )
             ''')
             
@@ -209,8 +302,6 @@ class DiaryStorage:
             
             if topics is not None:
                 updates.append("topics = ?")
-                # Store topics as JSON string or comma-separated. The prompt suggested flexibility.
-                # JSON is safer.
                 import json
                 params.append(json.dumps(topics))
                 
@@ -225,7 +316,7 @@ class DiaryStorage:
                 conn.commit()
 
     def save_fact(self, entry_id: int, fact_type: str, content: str):
-        """Save an extracted fact."""
+        """Save an extracted fact (Legacy Layer)."""
         with self._get_db() as conn:
             cursor = conn.cursor()
             cursor.execute('''
@@ -340,7 +431,6 @@ class DiaryStorage:
             for row in reversed(rows):
                 role_name = "User" if row[0] == "user" else "MEMO"
                 try:
-                    # remove any potential JSON artifacts from older versions if they exist
                      clean_text = row[1].replace('"', '') 
                 except:
                      clean_text = row[1]
@@ -380,21 +470,16 @@ class DiaryStorage:
             if not rows:
                 return 0
             
-            # Helper to parse date string from SQLite
             def parse_date(date_str):
-                # SQLite 'date()' returns YYYY-MM-DD
                 return datetime.strptime(date_str, "%Y-%m-%d").date()
 
             dates = [parse_date(r[0]) for r in rows]
             
-            # Check if active today or yesterday (streak logic)
             today = datetime.now().date()
             if dates[0] != today and dates[0] != (today - timedelta(days=1)):
                 return 0 # Streak broken
                 
             streak = 1
-            # Iterate backwards to find consecutive days
-            # Note: dates are already sorted DESC
             curr = dates[0]
             
             for i in range(1, len(dates)):
@@ -406,6 +491,318 @@ class DiaryStorage:
                     break
                     
             return streak
+
+    # --- NEW: Layer 2 - Structured Memory Access ---
+    
+    def add_memory_item(self, session_id: str, memory_type: str, memory_key: str, memory_value: str, source_entry_id: int, confidence: float = 1.0):
+        """Add or Update a structured memory item."""
+        with self._get_db() as conn:
+            cursor = conn.cursor()
+            last_updated = datetime.now().isoformat()
+            
+            # Check if exists (upsert logic somewhat)
+            cursor.execute('SELECT id FROM memory_index WHERE session_id = ? AND memory_key = ?', (session_id, memory_key))
+            row = cursor.fetchone()
+            
+            if row:
+                # Update
+                cursor.execute('''
+                    UPDATE memory_index 
+                    SET memory_value = ?, memory_type = ?, source_entry_id = ?, confidence = ?, last_updated = ?
+                    WHERE id = ?
+                ''', (memory_value, memory_type, source_entry_id, confidence, last_updated, row[0]))
+            else:
+                # Insert
+                cursor.execute('''
+                    INSERT INTO memory_index (session_id, memory_type, memory_key, memory_value, source_entry_id, confidence, last_updated)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                ''', (session_id, memory_type, memory_key, memory_value, source_entry_id, confidence, last_updated))
+            
+            conn.commit()
+        
+        # Invalidate cache for this session (Simple approach)
+        if session_id in self._memory_cache:
+            del self._memory_cache[session_id]
+
+    def get_memory_items(self, session_id: str, memory_key: str = None, memory_type: str = None) -> List[Dict]:
+        """Retrieve structured memory items."""
+        # Check Cache (Only if looking for specific key to match "search usage")
+        cache_key = f"{session_id}_{memory_key}_{memory_type}"
+        if session_id in self._memory_cache and cache_key in self._memory_cache[session_id]:
+             return self._memory_cache[session_id][cache_key]
+
+        with self._get_db() as conn:
+            cursor = conn.cursor()
+            sql = "SELECT memory_type, memory_key, memory_value, confidence, last_updated FROM memory_index WHERE session_id = ?"
+            params = [session_id]
+            
+            if memory_key:
+                sql += " AND memory_key = ?"
+                params.append(memory_key)
+            
+            if memory_type:
+                sql += " AND memory_type = ?"
+                params.append(memory_type)
+                
+            cursor.execute(sql, params)
+            rows = cursor.fetchall()
+            
+            results = [
+                {
+                    "memory_type": r[0],
+                    "memory_key": r[1],
+                    "memory_value": r[2],
+                    "confidence": r[3],
+                    "last_updated": r[4]
+                }
+                for r in rows
+            ]
+            
+            # Update Cache
+            if session_id not in self._memory_cache: self._memory_cache[session_id] = {}
+            if len(self._memory_cache[session_id]) > 20: self._memory_cache[session_id].clear() # Simple Limit
+            self._memory_cache[session_id][cache_key] = results
+            
+            return results
+
+    def get_memory_items_batch(self, session_id: str, memory_keys: List[str]) -> List[Dict]:
+        """Retrieve multiple memory items in a single query."""
+        if not memory_keys:
+            return []
+            
+        with self._get_db() as conn:
+            cursor = conn.cursor()
+            # Prepare placeholders: ?,?,?
+            placeholders = ','.join(['?'] * len(memory_keys))
+            sql = f"SELECT memory_type, memory_key, memory_value, confidence, last_updated FROM memory_index WHERE session_id = ? AND memory_key IN ({placeholders})"
+            
+            params = [session_id] + memory_keys
+            cursor.execute(sql, params)
+            rows = cursor.fetchall()
+            
+            return [
+                 {
+                    "memory_type": r[0],
+                    "memory_key": r[1],
+                    "memory_value": r[2],
+                    "confidence": r[3],
+                    "last_updated": r[4]
+                }
+                for r in rows
+            ]
+
+    # --- NEW: Layer 3 - Daily Summary Access ---
+
+    def upsert_daily_summary(self, session_id: str, date: str, summary: str, key_events: str, mood: str):
+        """Insert or Update the daily summary."""
+        with self._get_db() as conn:
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                INSERT INTO daily_summary (session_id, date, summary, key_events, dominant_mood)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(session_id, date) DO UPDATE SET
+                    summary = excluded.summary,
+                    key_events = excluded.key_events,
+                    dominant_mood = excluded.dominant_mood
+            ''', (session_id, date, summary, key_events, mood))
+            
+            conn.commit()
+            
+            # Update Cache
+            self._summary_cache[f"{session_id}_{date}"] = {
+                "summary": summary,
+                "key_events": key_events,
+                "dominant_mood": mood
+            }
+
+    def get_daily_summary(self, session_id: str, date: str) -> Optional[Dict]:
+        """Get summary for a specific date."""
+        # Check Cache
+        cache_key = f"{session_id}_{date}"
+        if cache_key in self._summary_cache:
+            return self._summary_cache[cache_key]
+
+        with self._get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT summary, key_events, dominant_mood FROM daily_summary WHERE session_id = ? AND date = ?', (session_id, date))
+            row = cursor.fetchone()
+            
+            if row:
+                res = {
+                    "summary": row[0],
+                    "key_events": row[1],
+                    "dominant_mood": row[2]
+                }
+                self._summary_cache[cache_key] = res
+                return res
+            return None
+
+    # --- NEW: Layer 4 & 5 Access Methods ---
+
+    def upsert_topic_state(self, session_id: str, topic: str, state: str):
+        """Update the consolidated state of a life topic."""
+        with self._get_db() as conn:
+            cursor = conn.cursor()
+            last_updated = datetime.now().isoformat()
+            
+            cursor.execute('''
+                INSERT INTO topic_state (session_id, topic, state, last_updated)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(session_id, topic) DO UPDATE SET
+                    state = excluded.state,
+                    last_updated = excluded.last_updated
+            ''', (session_id, topic, state, last_updated))
+            conn.commit()
+
+    def get_topic_states(self, session_id: str, topics: List[str] = None) -> Dict[str, str]:
+        """Get the current state of specific topics (or all if None)."""
+        with self._get_db() as conn:
+            cursor = conn.cursor()
+            if topics:
+                placeholders = ','.join(['?'] * len(topics))
+                sql = f"SELECT topic, state FROM topic_state WHERE session_id = ? AND topic IN ({placeholders})"
+                params = [session_id] + topics
+            else:
+                sql = "SELECT topic, state FROM topic_state WHERE session_id = ?"
+                params = [session_id]
+                
+            cursor.execute(sql, params)
+            return {row[0]: row[1] for row in cursor.fetchall()}
+
+    def upsert_weekly_summary(self, session_id: str, start_date: str, end_date: str, summary: str, mood: str):
+        with self._get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO weekly_summary (session_id, start_date, end_date, summary, dominant_mood)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(session_id, start_date) DO UPDATE SET
+                    summary = excluded.summary,
+                    dominant_mood = excluded.dominant_mood
+            ''', (session_id, start_date, end_date, summary, mood))
+            conn.commit()
+
+    def get_weekly_summaries(self, session_id: str, limit: int = 4) -> List[Dict]:
+        with self._get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT start_date, end_date, summary, dominant_mood FROM weekly_summary WHERE session_id = ? ORDER BY start_date DESC LIMIT ?', (session_id, limit))
+            cols = ["start_date", "end_date", "summary", "dominant_mood"]
+            return [dict(zip(cols, row)) for row in cursor.fetchall()]
+
+    def upsert_monthly_summary(self, session_id: str, month: str, summary: str, mood: str):
+        with self._get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO monthly_summary (session_id, month, summary, dominant_mood)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(session_id, month) DO UPDATE SET
+                    summary = excluded.summary,
+                    dominant_mood = excluded.dominant_mood
+            ''', (session_id, month, summary, mood))
+            conn.commit()
+
+    def get_monthly_summaries(self, session_id: str, limit: int = 6) -> List[Dict]:
+        with self._get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT month, summary, dominant_mood FROM monthly_summary WHERE session_id = ? ORDER BY month DESC LIMIT ?', (session_id, limit))
+            cols = ["month", "summary", "dominant_mood"]
+            return [dict(zip(cols, row)) for row in cursor.fetchall()]
+
+    # --- NEW: Layer 6 Methods (Metrics) ---
+
+    def upsert_daily_metrics(self, session_id: str, date: str, energy: int = None, stress: int = None, sleep: int = None):
+        """Insert or Update daily numeric metrics."""
+        with self._get_db() as conn:
+            cursor = conn.cursor()
+            
+            # Simple upsert with partial updates is tricky in pure SQL without reading first or complex COALESCE
+            # But since this comes from daily summary, we usually write all at once.
+            # We'll rely on ON CONFLICT DO UPDATE
+            
+            cursor.execute('''
+                INSERT INTO daily_metrics (session_id, date, energy, stress, sleep)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(session_id, date) DO UPDATE SET
+                    energy = COALESCE(excluded.energy, daily_metrics.energy),
+                    stress = COALESCE(excluded.stress, daily_metrics.stress),
+                    sleep = COALESCE(excluded.sleep, daily_metrics.sleep)
+            ''', (session_id, date, energy, stress, sleep))
+            conn.commit()
+
+    def get_daily_metrics_range(self, session_id: str, start_date: str, end_date: str) -> List[Dict]:
+        """Get structured metrics for a date range."""
+        with self._get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT date, energy, stress, sleep FROM daily_metrics
+                WHERE session_id = ? AND date BETWEEN ? AND ?
+                ORDER BY date ASC
+            ''', (session_id, start_date, end_date))
+            
+            return [
+                {"date": r[0], "energy": r[1], "stress": r[2], "sleep": r[3]}
+                for r in cursor.fetchall()
+            ]
+
+    # --- ADMIN ANALYTICS ---
+
+    def get_analytics_stats(self) -> Dict[str, Any]:
+        """
+        Get aggregated analytics for the admin dashboard.
+        Returns:
+            - total_users
+            - new_users_today
+            - active_users_24h
+            - total_messages
+            - daily_growth (last 7 days)
+            - activity_trend (last 7 days)
+        """
+        stats = {}
+        with self._get_db() as conn:
+            cursor = conn.cursor()
+
+            # 1. Total Users
+            cursor.execute("SELECT COUNT(*) FROM users")
+            stats['total_users'] = cursor.fetchone()[0]
+
+            # 2. Total Messages
+            cursor.execute("SELECT COUNT(*) FROM entries")
+            stats['total_messages'] = cursor.fetchone()[0]
+
+            # 3. New Users Today (Using ISO string slicing for YYYY-MM-DD)
+            today_str = datetime.now().strftime("%Y-%m-%d")
+            cursor.execute("SELECT COUNT(*) FROM users WHERE substr(created_at, 1, 10) = ?", (today_str,))
+            stats['new_users_today'] = cursor.fetchone()[0]
+
+            # 4. Active Users (24h) - Distinct sessions in entries
+            yesterday_iso = (datetime.now() - timedelta(days=1)).isoformat()
+            cursor.execute("SELECT COUNT(DISTINCT session_id) FROM entries WHERE timestamp > ?", (yesterday_iso,))
+            stats['active_users_24h'] = cursor.fetchone()[0]
+
+            # 5. User Growth Trend (Last 7 Days)
+            # SQLite doesn't have convenient generate_series, so we query groupings and fill gaps in Python if strictly needed, 
+            # or just return what we have.
+            cursor.execute('''
+                SELECT substr(created_at, 1, 10) as day, COUNT(*) 
+                FROM users 
+                GROUP BY day 
+                ORDER BY day DESC 
+                LIMIT 7
+            ''')
+            # List of [date, count], newest first
+            stats['daily_growth'] = cursor.fetchall()[::-1] 
+
+            # 6. Activity Trend (Last 7 Days) - Message count by day
+            cursor.execute('''
+                SELECT substr(timestamp, 1, 10) as day, COUNT(*) 
+                FROM entries 
+                GROUP BY day 
+                ORDER BY day DESC 
+                LIMIT 7
+            ''')
+            stats['activity_trend'] = cursor.fetchall()[::-1]
+
+        return stats
 
 # Global instance
 storage = DiaryStorage()

@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Admin Access | MemoDiary</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <style>
+        body {
+            background-color: #050505;
+            color: #e0e0e0;
+            font-family: 'Inter', sans-serif;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+        }
+
+        .login-card {
+            background: rgba(20, 20, 25, 0.6);
+            backdrop-filter: blur(20px);
+            padding: 40px;
+            border-radius: 16px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            width: 100%;
+            max-width: 360px;
+            text-align: center;
+            box-shadow: 0 20px 50px rgba(0, 0, 0, 0.5);
+        }
+
+        .logo-mark {
+            width: 40px;
+            height: 40px;
+            background: linear-gradient(135deg, #eee, #999);
+            border-radius: 50%;
+            margin: 0 auto 20px;
+            opacity: 0.8;
+        }
+
+        h2 {
+            font-weight: 500;
+            margin-bottom: 30px;
+            font-size: 1.2rem;
+            color: #fff;
+            letter-spacing: 0.5px;
+        }
+
+        .input-group {
+            margin-bottom: 20px;
+            text-align: left;
+        }
+
+        label {
+            display: block;
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            color: #666;
+            margin-bottom: 8px;
+            letter-spacing: 1px;
+        }
+
+        input {
+            width: 100%;
+            background: #111;
+            border: 1px solid #333;
+            color: #fff;
+            padding: 12px;
+            border-radius: 8px;
+            font-size: 0.9rem;
+            box-sizing: border-box;
+            transition: all 0.2s ease;
+        }
+
+        input:focus {
+            outline: none;
+            border-color: #555;
+            background: #151515;
+            box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.05);
+        }
+
+        button {
+            width: 100%;
+            padding: 12px;
+            background: #fff;
+            color: #000;
+            border: none;
+            border-radius: 8px;
+            font-weight: 600;
+            cursor: pointer;
+            margin-top: 10px;
+            transition: transform 0.1s ease, background 0.2s;
+        }
+
+        button:hover {
+            background: #e0e0e0;
+        }
+
+        button:active {
+            transform: scale(0.98);
+        }
+
+        #error-msg {
+            margin-top: 20px;
+            color: #ff4444;
+            font-size: 0.85rem;
+            display: none;
+        }
+    </style>
+</head>
+
+<body>
+
+    <div class="login-card">
+        <div class="logo-mark"></div>
+        <h2>Restricted Access</h2>
+
+        <form id="loginForm">
+            <div class="input-group">
+                <label>Admin 6-Digit PIN</label>
+                <div style="position: relative;">
+                    <input type="password" id="pin" required maxlength="6"
+                        style="padding-right: 40px; text-align: center; letter-spacing: 5px; font-size: 1.2rem;"
+                        inputmode="numeric" placeholder="• • • • • •">
+                    <span id="togglePin"
+                        style="position: absolute; right: 10px; top: 50%; transform: translateY(-50%); cursor: pointer; opacity: 0.6;">
+                        <!-- Eye Icon -->
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                            stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path>
+                            <circle cx="12" cy="12" r="3"></circle>
+                        </svg>
+                    </span>
+                </div>
+            </div>
+
+            <button type="submit">Unlock Dashboard</button>
+            <div id="error-msg">Invalid PIN. Access denied.</div>
+        </form>
+    </div>
+
+    <script>
+        const togglePin = document.getElementById('togglePin');
+        const pinInput = document.getElementById('pin');
+
+        togglePin.addEventListener('click', function () {
+            const type = pinInput.getAttribute('type') === 'password' ? 'text' : 'password';
+            pinInput.setAttribute('type', type);
+            this.style.opacity = type === 'text' ? '1' : '0.6';
+        });
+
+        document.getElementById('loginForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const pin = document.getElementById('pin').value.trim();
+            const errorMsg = document.getElementById('error-msg');
+            const btn = e.target.querySelector('button');
+
+            btn.textContent = "Verifying...";
+            btn.disabled = true;
+            errorMsg.style.display = 'none';
+
+            try {
+                const res = await fetch('/api/admin/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ pin: pin })
+                });
+
+                if (res.ok) {
+                    const data = await res.json();
+                    sessionStorage.setItem('admin_token', data.token);
+                    window.location.href = '/static/dashboard.html';
+                } else {
+                    errorMsg.style.display = 'block';
+                    btn.textContent = "Unlock Dashboard";
+                    btn.disabled = false;
+                }
+            } catch (err) {
+                console.error(err);
+                errorMsg.textContent = "Connection error.";
+                errorMsg.style.display = 'block';
+                btn.textContent = "Unlock Dashboard";
+                btn.disabled = false;
+            }
+        });
+    </script>
+</body>
+
+</html>

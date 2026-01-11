@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Analytics | MemoDiary Admin</title>
+    <!-- Chart.js via CDN -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body {
+            background-color: #050505;
+            color: #d0d0d0;
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            margin: 0;
+            padding: 0;
+            overflow-x: hidden;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 40px;
+            border-bottom: 1px solid #222;
+            padding-bottom: 20px;
+        }
+
+        .brand {
+            font-size: 1.2rem;
+            font-weight: 600;
+            color: #fff;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .brand span {
+            color: #666;
+            font-weight: 400;
+            font-size: 0.9rem;
+        }
+
+        .logout-btn {
+            background: none;
+            border: 1px solid #333;
+            color: #888;
+            padding: 8px 16px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.85rem;
+            transition: all 0.2s;
+        }
+
+        .logout-btn:hover {
+            border-color: #555;
+            color: #fff;
+        }
+
+        /* Stats Grid */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            /* Force 4 columns on large screens */
+            gap: 20px;
+            margin-bottom: 40px;
+        }
+
+        @media (max-width: 1024px) {
+            .stats-grid {
+                grid-template-columns: repeat(2, 1fr);
+                /* 2x2 on tablets */
+            }
+        }
+
+        @media (max-width: 600px) {
+            .stats-grid {
+                grid-template-columns: 1fr;
+                /* Stack on mobile */
+            }
+        }
+
+        .stat-card {
+            background: #111;
+            border: 1px solid #222;
+            border-radius: 12px;
+            padding: 24px;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            min-height: 120px;
+            transition: transform 0.2s, border-color 0.2s;
+        }
+
+        .stat-card:hover {
+            transform: translateY(-2px);
+            border-color: #333;
+        }
+
+        .stat-label {
+            font-size: 0.8rem;
+            text-transform: uppercase;
+            color: #888;
+            margin-bottom: 10px;
+            letter-spacing: 0.5px;
+            font-weight: 500;
+        }
+
+        .stat-value {
+            font-size: 2.2rem;
+            font-weight: 700;
+            color: #fff;
+            line-height: 1;
+        }
+
+        /* Charts Area */
+        .charts-container {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            /* Side by side strict */
+            gap: 24px;
+        }
+
+        @media (max-width: 900px) {
+            .charts-container {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        .chart-box {
+            background: #111;
+            border: 1px solid #222;
+            border-radius: 12px;
+            padding: 24px;
+            /* Removed min-height to let wrapper dictate size */
+            display: flex;
+            flex-direction: column;
+        }
+
+        .canvas-wrapper {
+            position: relative;
+            height: 300px;
+            width: 100%;
+        }
+
+        .chart-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+
+        .chart-title {
+            font-size: 1rem;
+            font-weight: 600;
+            color: #eee;
+        }
+
+        /* Loading */
+        .loading-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: #050505;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            z-index: 1000;
+            backdrop-filter: blur(10px);
+        }
+    </style>
+</head>
+
+<body>
+
+    <div class="loading-overlay" id="loading">
+        <div>Loading Analytics...</div>
+    </div>
+
+    <div class="container">
+        <header>
+            <div class="brand">MemoDiary <span>Admin Console</span></div>
+            <button class="logout-btn" onclick="logout()">Sign Out</button>
+        </header>
+
+        <!-- Summary Cards -->
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-label">Total Users</div>
+                <div class="stat-value" id="val-total-users">-</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Users Today</div>
+                <div class="stat-value" id="val-new-users">-</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Active (24h)</div>
+                <div class="stat-value" id="val-active-users">-</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Total Messages</div>
+                <div class="stat-value" id="val-total-msgs">-</div>
+            </div>
+        </div>
+
+        <!-- Charts -->
+        <div class="charts-container">
+            <div class="chart-box">
+                <div class="chart-header">
+                    <div class="chart-title">User Growth (Last 7 Days)</div>
+                </div>
+                <div class="canvas-wrapper">
+                    <canvas id="growthChart"></canvas>
+                </div>
+            </div>
+            <div class="chart-box">
+                <div class="chart-header">
+                    <div class="chart-title">Message Volume (Last 7 Days)</div>
+                </div>
+                <div class="canvas-wrapper">
+                    <canvas id="activityChart"></canvas>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const token = sessionStorage.getItem('admin_token');
+        if (!token) {
+            window.location.href = 'admin_login.html';
+        }
+
+        // Charts
+        let growthChart = null;
+        let activityChart = null;
+
+        async function fetchStats() {
+            try {
+                const res = await fetch('/api/admin/stats', {
+                    headers: { 'Authorization': `Bearer ${token}` }
+                });
+
+                if (res.status === 401 || res.status === 403) {
+                    logout();
+                    return;
+                }
+
+                if (!res.ok) throw new Error("Failed to fetch");
+
+                const data = await res.json();
+                renderDashboard(data);
+
+                document.getElementById('loading').style.display = 'none';
+
+            } catch (e) {
+                console.error(e);
+                // Optionally show error toast
+            }
+        }
+
+        function renderDashboard(data) {
+            // Update Cards
+            document.getElementById('val-total-users').textContent = data.total_users;
+            document.getElementById('val-new-users').textContent = data.new_users_today;
+            document.getElementById('val-active-users').textContent = data.active_users_24h;
+            document.getElementById('val-total-msgs').textContent = data.total_messages.toLocaleString();
+
+            // Prepare Chart Data
+            const growthLabels = data.daily_growth.map(x => x[0]); // Dates
+            const growthValues = data.daily_growth.map(x => x[1]); // Counts
+
+            const activityLabels = data.activity_trend.map(x => x[0]);
+            const activityValues = data.activity_trend.map(x => x[1]);
+
+            updateGrowthChart(growthLabels, growthValues);
+            updateActivityChart(activityLabels, activityValues);
+        }
+
+        function updateGrowthChart(labels, dataPoints) {
+            const ctx = document.getElementById('growthChart').getContext('2d');
+
+            if (growthChart) {
+                growthChart.data.labels = labels;
+                growthChart.data.datasets[0].data = dataPoints;
+                growthChart.update();
+                return;
+            }
+
+            growthChart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: labels,
+                    datasets: [{
+                        label: 'New Users',
+                        data: dataPoints,
+                        borderColor: '#2196f3',
+                        backgroundColor: 'rgba(33, 150, 243, 0.1)',
+                        borderWidth: 2,
+                        tension: 0.4,
+                        fill: true
+                    }]
+                },
+                options: getChartOptions()
+            });
+        }
+
+        function updateActivityChart(labels, dataPoints) {
+            const ctx = document.getElementById('activityChart').getContext('2d');
+
+            if (activityChart) {
+                activityChart.data.labels = labels;
+                activityChart.data.datasets[0].data = dataPoints;
+                activityChart.update();
+                return;
+            }
+
+            activityChart = new Chart(ctx, {
+                type: 'bar',
+                data: {
+                    labels: labels,
+                    datasets: [{
+                        label: 'Messages',
+                        data: dataPoints,
+                        backgroundColor: '#4caf50',
+                        borderRadius: 4
+                    }]
+                },
+                options: getChartOptions()
+            });
+        }
+
+        function getChartOptions() {
+            return {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {
+                    legend: { display: false },
+                    tooltip: { mode: 'index', intersect: false }
+                },
+                scales: {
+                    y: {
+                        beginAtZero: true,
+                        grid: { color: '#222' },
+                        ticks: { color: '#666' }
+                    },
+                    x: {
+                        grid: { display: false },
+                        ticks: { color: '#666' }
+                    }
+                }
+            };
+        }
+
+        function logout() {
+            sessionStorage.removeItem('admin_token');
+            window.location.href = 'admin_login.html';
+        }
+
+        // Initial Load
+        fetchStats();
+
+        // Refresh every 30s
+        setInterval(fetchStats, 30000);
+    </script>
+</body>
+
+</html>

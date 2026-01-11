@@ -23,50 +23,72 @@ def safe_print(text: str):
         print(text.encode('ascii', 'replace').decode('ascii'))
 
 MEMORY_EXTRACTION_PROMPT = """
-You are a Memory Extractor. Your goal is to identify and extract key facts and structured metadata from the user's input for a long-term memory database.
+You are a Memory Extractor. Your goal is to extract structured, atomic facts from the user's diary entry for a long-term memory index.
 
-**CORE ODJECTIVE:**
-From every input, intelligently extract and store meaningful keywords and entities such as people names, events, objects, emotions, dates, and contexts.
+**CORE OBSESSION**:
+Extract PERMANENT, RETRIEVABLE facts about the user's life, preferences, and key entities.
+Do NOT summarize the text. Extract specific "key-value" pairs.
 
-**EXTRACTION RULES:**
-1. **Facts**: Extract explicit facts.
-   - **People**: Names (e.g., "Kunal", "Mom").
-   - **Events**: "Trip to Goa", "Birthday party", "Meeting".
-   - **Objects**: "PS5", "Car", "Gift", "Wallet".
-   - **Emotions**: "Happy", "Anxious", "Excited".
-   - **Dates/Time**: "2025", "January", "Yesterday".
-2. **Context**: Ignore filler words ("I think", "maybe"). Focus on the core information.
+**TARGET MEMORY TYPES**:
+1. **profile**: Name, age, gender.
+2. **pet**: Pet names, breeds, traits.
+3. **event**: Life events (birthdays, anniversaries, trips).
+4. **preference**: Likes/dislikes (food, color, music, movies).
+5. **work**: Job title, company, projects, colleagues.
+6. **education**: School, degree, major.
+7. **health**: Allergies, conditions, medications.
+8. **location**: Current city, hometown, addresses.
+9. **relationship**: Family members, friends, partners.
 
-**METADATA FIELDS:**
-You MUST classify the entry with these fields:
-- **event_type**: Choose ONE: [birthday, interview, travel, health, work, relationship, education, purchase, general_observation].
-- **topics**: A list of **NORMALIZED KEYWORDS/TAGS**. These should be single words or short phrases suitable for search indexing (e.g., "ps5", "kunal", "goa", "gift").
-- **importance**: [normal, emotional, milestone].
+**NEW: TOPIC STATE UPDATES**:
+Also identify if the user's "Current State" for a specific life dimension has changed or was mentioned.
+Topics: `health`, `food`, `routine`, `work`, `travel_preferences`.
+Example: "I have a cold" -> topic: "health", state: "Has a cold (Jan 10)".
+Example: "I am going vegan" -> topic: "food", state: "Vegan diet".
 
-**OUTPUT FORMAT (JSON ONLY):**
+**OUTPUT FORMAT (JSON ONLY)**:
+Return a JSON object with:
+1. `memories`: List of atomic facts (as defined above).
+2. `topic_updates`: List of state objects: `{"topic": "...", "state": "..."}`.
+
+**EXAMPLES**:
+
+Input: "My dog's name is Bhima. I usually wake up at 6am to walk him."
+Output:
 {
-  "event_type": "purchase",
-  "topics": ["ps5", "gaming", "sony", "gift"],
-  "importance": "normal",
-  "facts": [
-    {"type": "object", "content": "User bought a PS5"},
-    {"type": "person", "content": "Kunal (friend)"},
-    {"type": "date", "content": "2025-01-01"}
+  "memories": [
+    {"memory_type": "pet", "memory_key": "dog_name", "memory_value": "Bhima", "confidence": 1.0}
+  ],
+  "topic_updates": [
+    {"topic": "routine", "state": "Wakes up at 6am for dog walk"}
   ]
 }
 
-**EXAMPLES:**
-Input: "I bought a PS5 for Kunal's birthday."
-Output:
+If no relevant permanent facts or updates are found, return empty lists.
+"""
+
+DAILY_SUMMARY_PROMPT = """
+You are a Daily Diarist. Your goal is to summarize the user's day based on their entries.
+
+TASK:
+1. Create a concise summary of the day's events (max 3 sentences).
+2. Identify key concrete events (list strings).
+3. Determine the dominant mood (one emoji).
+4. **ESTIMATE METRICS (1-10)**:
+   - `energy`: 1 (Exhausted) to 10 (Hyper). Default 5.
+   - `stress`: 1 (Zen) to 10 (Panic). Default 3.
+   - `sleep`: Estimated hours (e.g., 7) or Quality (1-10) if mentioned. If unknown, return -1.
+
+OUTPUT JSON:
 {
-  "event_type": "purchase",
-  "topics": ["ps5", "kunal", "birthday", "gift"],
-  "importance": "normal",
-  "facts": [
-    {"type": "object", "content": "User bought a PS5"},
-    {"type": "person", "content": "Kunal"},
-    {"type": "event", "content": "Kunal's Birthday"}
-  ]
+  "summary": "...",
+  "key_events": ["..."],
+  "dominant_mood": "Mood",
+  "metrics": {
+      "energy": 5,
+      "stress": 3,
+      "sleep": -1
+  }
 }
 """
 
@@ -77,8 +99,8 @@ class MemoryProcessor:
     def _get_client(self):
         key = key_manager.get_next_key()
         if key:
-            # UPGRADE: Standardization on 2.0 Flash (v1alpha) for consistent behavior
-            return genai.Client(api_key=key, http_options={'api_version': 'v1alpha'})
+            # Using 2.0 Flash for extraction as per instructions (cheap/fast)
+            return genai.Client(api_key=key, http_options={'api_version': 'v1beta'})
         return None
 
     async def process_entry(self, session_id: str, text: str, entry_id: int):
@@ -90,43 +112,110 @@ class MemoryProcessor:
             return
 
         try:
-            safe_print(f"DEBUG: Processing memory for: {text[:30]}...")
+            # safe_print(f"DEBUG: Processing memory for: {text[:30]}...")
             
-            # UPGRADE: 2.0 Flash for accurate extraction
+            # 1. Fact Extraction
             response = await client.aio.models.generate_content(
-                model="gemini-2.0-flash",
+                model="gemini-2.0-flash", 
                 contents=text,
                 config=types.GenerateContentConfig(
                     system_instruction=MEMORY_EXTRACTION_PROMPT,
                     response_mime_type="application/json",
-                    temperature=0.1
+                    temperature=0.0
                 )
             )
             
             text_res = response.text.strip()
             data = json.loads(text_res)
             
-            # Save Metadata
-            e_type = data.get("event_type", "general_observation")
-            topics = data.get("topics", [])
-            importance = data.get("importance", "normal")
+            memories = data.get("memories", [])
+            topics = data.get("topic_updates", [])
             
-            storage.update_entry_metadata(entry_id, event_type=e_type, topics=topics, importance=importance)
+            if memories:
+                safe_print(f"🧠 STRUCTURING MEMORY: Found {len(memories)} items.")
+                for mem in memories:
+                    m_type = mem.get("memory_type")
+                    m_key = mem.get("memory_key")
+                    m_val = mem.get("memory_value")
+                    conf = mem.get("confidence", 0.5)
+                    
+                    if m_type and m_key and m_val:
+                         storage.add_memory_item(session_id, m_type, m_key, m_val, entry_id, conf)
+
+            if topics:
+                safe_print(f"🔄 TOPIC UPDATES: Found {len(topics)} items.")
+                for t in topics:
+                    topic = t.get("topic")
+                    state = t.get("state")
+                    if topic and state:
+                        # We append date to state to give it context
+                        date_str = datetime.now().strftime("%Y-%m-%d")
+                        full_state = f"{state} ({date_str})"
+                        storage.upsert_topic_state(session_id, topic, full_state)
             
-            # Save Facts
-            facts = data.get("facts", [])
-            
-            if facts:
-                safe_print(f"🧠 EXTRACTED MEMORIES ({e_type}, {importance}): {facts}")
-                for fact in facts:
-                    # fact is now a dict: {"type": "...", "content": "..."}
-                    f_type = fact.get("type", "detail")
-                    f_content = fact.get("content", "")
-                    if f_content:
-                        storage.save_fact(entry_id, f_type, f_content)
-            
+            # 2. Lazy Daily Summary Update (Optimization: Use specific trigger or probability?)
+            # For MVP completeness as per "Optionally update today’s daily_summary" rule:
+            # We will run this update explicitly. To avoid cost, maybe only run if text > 20 chars?
+            if len(text) > 20: 
+                 await self.update_daily_summary(session_id)
+
         except Exception as e:
             safe_print(f"Error processing memory via Gemini: {e}")
+
+    async def update_daily_summary(self, session_id: str):
+        """Updates the daily summary for the current day."""
+        client = self._get_client()
+        if not client: return
+        
+        today_date = datetime.now().strftime("%Y-%m-%d")
+        
+        # optimized: check if summary exists and is recent? 
+        # For now, we rebuild it.
+        start = f"{today_date}T00:00:00"
+        end = f"{today_date}T23:59:59"
+        
+        entries = storage.get_entries_in_range(session_id, start, end)
+        if not entries: return
+
+        # Combine text
+        combined_text = "\n".join([f"- {e['text']}" for e in entries])
+        
+        try:
+            response = await client.aio.models.generate_content(
+                model="gemini-2.0-flash", 
+                contents=combined_text,
+                config=types.GenerateContentConfig(
+                    system_instruction=DAILY_SUMMARY_PROMPT,
+                    response_mime_type="application/json",
+                    temperature=0.3
+                )
+            )
+            data = json.loads(response.text.strip())
+            
+            summary = data.get("summary", "")
+            key_events = json.dumps(data.get("key_events", []))
+            mood = data.get("dominant_mood", "😐")
+            
+            storage.upsert_daily_summary(session_id, today_date, summary, key_events, mood)
+            
+            # SAVE METRICS (New)
+            metrics = data.get("metrics", {})
+            if metrics:
+                energy = metrics.get("energy", 5)
+                stress = metrics.get("stress", 3)
+                sleep = metrics.get("sleep", -1)
+                
+                # Normalize defaults if missing
+                if energy is None: energy = 5
+                if stress is None: stress = 3
+                if sleep is None: sleep = -1
+                
+                storage.upsert_daily_metrics(session_id, today_date, energy, stress, sleep)
+            
+            safe_print(f"📅 UPDATED DAILY SUMMARY + METRICS for {today_date}")
+            
+        except Exception as e:
+            safe_print(f"Error updating daily summary: {e}")
 
 # Global instance
 memory_processor = MemoryProcessor()

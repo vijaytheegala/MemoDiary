@@ -1,7 +1,7 @@
 from dotenv import load_dotenv
 load_dotenv() # Load environment variables from .env file
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -11,14 +11,16 @@ import secrets
 import string
 import logging
 import traceback
+import io
 
 from app.session import get_session_history, add_message_to_session
 from app.ai import get_ai_response
 from app.utils.tts_engine import tts_engine
+from app.transcriber import transcriber
 from app.middleware.rate_limiter import chat_limiter # Restored import
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
-import io
+
 
 from logging.handlers import RotatingFileHandler
 
@@ -44,6 +46,7 @@ console_handler.setFormatter(log_formatter)
 logger.addHandler(console_handler)
 
 app = FastAPI(title="MemoDiary")
+print("--- SERVER RELOADED: ADMIN PIN LOGIC ACTIVE ---") # Force Reload Trigger
 
 # CORS (Safe defaults for deployment - adjust allowed_origins as needed)
 ALLOWED_ORIGINS = [
@@ -95,6 +98,9 @@ def generate_secure_id():
     return f"u_{secrets.token_urlsafe(16)}"
 
 
+from starlette.background import BackgroundTask
+from app.memory import memory_processor
+
 @app.post("/api/chat")
 async def chat(request: Request, chat_req: ChatRequest):
     session_id = chat_req.session_id
@@ -119,8 +125,13 @@ async def chat(request: Request, chat_req: ChatRequest):
         # 1. Retrieve history
         history = get_session_history(session_id)
 
-        # 2. Add User Msg to History (In-Memory)
-        add_message_to_session(session_id, "user", user_message)
+        # 2. Add User Msg to History (In-Memory + DB)
+        # REMOVED: Delegate to app/ai.py to avoid duplication
+        # user_entry_id = add_message_to_session(session_id, "user", user_message)
+
+        # Prepare Background Task for Learning
+        # REMOVED: Delegate to app/ai.py
+        # learning_task = BackgroundTask(...)
 
         # 3. Stream or Block
         if chat_req.stream:
@@ -142,18 +153,27 @@ async def chat(request: Request, chat_req: ChatRequest):
                         yield f"data: {chunk}\n\n"
                 
                 # Update Session History with full response
-                if full_response:
-                    add_message_to_session(session_id, "assistant", full_response)
+                # REMOVED: Delegate to app/ai.py
+                # if full_response:
+                #    add_message_to_session(session_id, "assistant", full_response)
                 
                 # Send 'done' event? or close.
                 yield "event: done\ndata: [DONE]\n\n"
 
-            return StreamingResponse(event_generator(), media_type="text/event-stream")
+            return StreamingResponse(
+                event_generator(), 
+                media_type="text/event-stream"
+                # background=learning_task # REMOVED
+            )
 
         else:
              # Standard JSON fallback
             ai_text, mood = await get_ai_response(session_id, history, user_message, stream=False)
-            add_message_to_session(session_id, "assistant", ai_text)
+            
+            # REMOVED: Delegate to app/ai.py
+            # add_message_to_session(session_id, "assistant", ai_text)
+            # asyncio.create_task(memory_processor.process_entry(session_id, user_message, user_entry_id))
+            
             return ChatResponse(response=ai_text, mood=mood, new_session_id=new_id_generated)
 
     except HTTPException as he:
@@ -240,6 +260,83 @@ async def startup_check(request: Request):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/api/transcribe")
+async def transcribe_endpoint(file: UploadFile = File(...)):
+    """
+    Transcribe uploaded audio file.
+    """
+    try:
+        # Read file
+        audio_bytes = await file.read()
+        mime_type = file.content_type or "audio/webm"
+        
+        # Transcribe
+        text = await transcriber.transcribe_audio(audio_bytes, mime_type)
+        
+        return {"text": text}
+    except Exception as e:
+        logger.error(f"Transcribe API Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# --- ADMIN PANEL ---
+
+# Secure constants (PIN: 148314)
+ADMIN_SALT_HEX = "7d808147a534abdcd708343e801868e7"
+ADMIN_PIN_HASH_HEX = "8d2c5f5d5458e6c44d208a4df2665419b483bacbd4312815c99c4b26aca624cf"
+
+# In-memory admin session store
+ACTIVE_ADMIN_TOKENS = set()
+
+class AdminLoginRequest(BaseModel):
+    pin: str
+
+@app.post("/api/admin/login")
+async def admin_login(creds: AdminLoginRequest):
+    import hashlib
+    import secrets
+
+    print(f"DEBUG: Login attempt with PIN") 
+
+    # Verify PIN using Hash
+    try:
+        salt = bytes.fromhex(ADMIN_SALT_HEX)
+        target_hash = bytes.fromhex(ADMIN_PIN_HASH_HEX)
+        
+        # Compute hash of input
+        computed_key = hashlib.pbkdf2_hmac('sha256', creds.pin.encode('utf-8'), salt, 100000)
+        
+        # Constant time comparison to prevent timing attacks
+        if not secrets.compare_digest(computed_key, target_hash):
+            print("DEBUG: PIN hash mismatch")
+            raise HTTPException(status_code=401, detail="Invalid PIN")
+            
+    except Exception as e:
+        logger.error(f"Auth Error: {e}")
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    # Success -> Generate Token
+    token = secrets.token_urlsafe(32)
+    ACTIVE_ADMIN_TOKENS.add(token)
+    
+    return {"token": token}
+
+@app.get("/api/admin/stats")
+async def admin_stats(request: Request):
+    from app.storage import storage
+    
+    # 1. Check Auth Header: "Authorization: Bearer <token>"
+    auth_header = request.headers.get("Authorization")
+    if not auth_header or not auth_header.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid token")
+    
+    token = auth_header.split(" ")[1]
+    
+    if token not in ACTIVE_ADMIN_TOKENS:
+        raise HTTPException(status_code=403, detail="Unauthorized access")
+    
+    # 2. Fetch Data
+    stats = storage.get_analytics_stats()
+    return stats
 
 if __name__ == "__main__":
     import uvicorn

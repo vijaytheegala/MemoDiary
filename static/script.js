@@ -80,30 +80,146 @@ function updateMuteIcon() {
 // Initial update
 if (muteButton) updateMuteIcon();
 
-// Web Speech API Configuration
-const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-const recognition = SpeechRecognition ? new SpeechRecognition() : null;
-if (recognition) {
-    recognition.continuous = true;
-    recognition.lang = 'en-US';
-    recognition.interimResults = true; // Changed to true for better feedback
+// --- REPLACEMENT: Backend-Powered Speech Recognition (MediaRecorder) ---
+let mediaRecorder = null;
+let audioChunks = [];
+let isListening = false; // Track state
+let silenceTimer = null;
+const SILENCE_TIMEOUT = 2000; // 2 seconds delay
+let audioContext = null;
+let analyser = null;
+let microphone = null;
+let animationFrame = null;
 
-    // Auto-restart logic for long speech
-    recognition.onend = () => {
-        if (isListening) {
-            console.log("Speech Service Restarting...");
-            recognition.start();
-        }
-    };
+async function startRecording() {
+    try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
+
+        audioChunks = [];
+
+        mediaRecorder.ondataavailable = event => {
+            if (event.data.size > 0) audioChunks.push(event.data);
+        };
+
+        mediaRecorder.onstop = async () => {
+            stopVAD(); // Stop visualizer/VAD
+
+            // Create Blob
+            const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
+            if (audioBlob.size < 1000) {
+                // Too small, ignore
+                resetMicUI();
+                return;
+            }
+
+            // Send to Backend
+            statusText.textContent = "Transcribing...";
+            statusText.style.color = "var(--accent-primary)";
+
+            // UI Change: Switch from 'listening' (Red) to 'transcribing' (Theme Color)
+            micButton.classList.remove('listening');
+            micButton.classList.add('transcribing');
+
+            try {
+                const formData = new FormData();
+                formData.append("file", audioBlob, "voice.webm");
+
+                const response = await fetch('/api/transcribe', {
+                    method: 'POST',
+                    body: formData
+                });
+
+                if (!response.ok) throw new Error("Transcription Failed");
+
+                const data = await response.json();
+                const text = data.text;
+
+                if (text && text.length > 0) {
+                    addMessageToUI('user', text);
+                    sendMessageToAI(text);
+                } else {
+                    statusText.textContent = "I didn't catch that.";
+                }
+            } catch (e) {
+                console.error("Transcribe Error:", e);
+                statusText.textContent = "Error hearing you.";
+            } finally {
+                resetMicUI();
+                // Stop all tracks
+                stream.getTracks().forEach(track => track.stop());
+            }
+        };
+
+        mediaRecorder.start();
+        isListening = true;
+        micButton.classList.add('listening');
+        statusText.textContent = "Listening... (Click to stop)";
+        statusText.style.color = "#f87171";
+
+        // Start VAD / Visualizer
+        startVAD(stream);
+
+    } catch (e) {
+        console.error("Mic Error:", e);
+        statusText.textContent = "Microphone Access Denied";
+    }
 }
 
-let isListening = false;
-let transcriptBuffer = '';
-let latestInterim = ''; // New: Track pending words that aren't final yet
+function stopRecording() {
+    if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+        mediaRecorder.stop();
+    }
+    isListening = false;
+}
+
+function resetMicUI() {
+    micButton.classList.remove('listening');
+    micButton.classList.remove('transcribing');
+    statusText.textContent = "I’m here to hear you—press the mic to speak";
+    statusText.style.color = "var(--text-muted)";
+    isListening = false;
+}
+
+// Simple VAD / Audio Visualizer Setup
+function startVAD(stream) {
+    if (!audioContext) audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    analyser = audioContext.createAnalyser();
+    microphone = audioContext.createMediaStreamSource(stream);
+    microphone.connect(analyser);
+    analyser.fftSize = 256;
+    const bufferLength = analyser.frequencyBinCount;
+    const dataArray = new Uint8Array(bufferLength);
+
+    let lastVoiceTime = Date.now();
+
+    function detect() {
+        analyser.getByteFrequencyData(dataArray);
+        let sum = 0;
+        for (let i = 0; i < bufferLength; i++) {
+            sum += dataArray[i];
+        }
+        let average = sum / bufferLength;
+
+        // Threshold for "Speech"
+        if (average > 10) {
+            lastVoiceTime = Date.now();
+        }
+
+        if (isListening) animationFrame = requestAnimationFrame(detect);
+    }
+    detect();
+}
+
+function stopVAD() {
+    if (animationFrame) cancelAnimationFrame(animationFrame);
+}
+
+
 let isProcessing = false;
 let abortController = null;
 let lastRequestTime = 0;
-const COOLDOWN_MS = 2000;
+const COOLDOWN_MS = 500;
 
 // --- Voice Engine Initialization ---
 let availableVoices = [];
@@ -120,15 +236,9 @@ updateVoices();
 if (micButton) {
     micButton.addEventListener('click', () => {
         if (isListening) {
-            // Manual Stop -> Force Send
-            submitVoiceInput(); // Uses the global helper
+            stopRecording();
         } else {
-            transcriptBuffer = '';
-            try {
-                recognition.start();
-            } catch (e) {
-                console.warn("Mic start error:", e);
-            }
+            startRecording();
         }
     });
 }
@@ -253,165 +363,6 @@ function handleTextInput() {
     sendMessageToAI(text);
     userInput.value = '';
     userInput.blur();
-}
-
-// --- Speech Recognition Flow (VAD & Auto-Send) ---
-let silenceTimer = null;
-const SILENCE_TIMEOUT = 1500; // 1.5 seconds of silence = send
-let vadActive = false;
-
-recognition.onstart = () => {
-    isListening = true;
-    vadActive = true;
-    micButton.classList.add('listening');
-    statusText.textContent = "Listening... (Pause to send)";
-    statusText.style.color = "#f87171";
-    transcriptBuffer = '';
-    latestInterim = ''; // Reset interim
-};
-
-recognition.onend = () => {
-    // If we're still "technically" listening (isListening=true) but the engine stopped itself,
-    // it usually means we hit a silence timeout or network hiccup.
-    // However, our VAD logic handles the "silence" explicitly via timers.
-    // So if we land here, we should just clean up.
-
-    // Clear any pending silence timer
-    if (silenceTimer) clearTimeout(silenceTimer);
-
-    if (isListening) {
-        // If we were supposed to be listening but it ended, treat it as a "finish" event.
-        // Unless it was a very short hiccup, but simpler to just send what we have.
-        isListening = false;
-        micButton.classList.remove('listening');
-
-        if (transcriptBuffer.trim().length > 0) {
-            submitVoiceInput();
-        } else {
-            // Nothing said? Just reset.
-            statusText.textContent = "I’m here to hear you—press the mic to speak";
-            statusText.style.color = "var(--text-muted)";
-        }
-    } else {
-        // Normal manual stop
-        micButton.classList.remove('listening');
-    }
-    vadActive = false;
-};
-
-function submitVoiceInput() {
-    // COMBINE finalized text + any pending interim text
-    // This fixes the "dropped words" issue when stopping manually or via VAD
-    const text = (transcriptBuffer + ' ' + latestInterim).replace(/\s+/g, ' ').trim();
-    
-    transcriptBuffer = ''; 
-    latestInterim = ''; // Clear everything
-
-    // Stop recognition thoroughly
-    try { recognition.stop(); } catch (e) { }
-    isListening = false;
-    micButton.classList.remove('listening');
-
-    if (text.length > 0) {
-        addMessageToUI('user', text);
-        sendMessageToAI(text);
-    } else {
-        statusText.textContent = "I’m here to hear you—press the mic to speak";
-        statusText.style.color = "var(--text-muted)";
-    }
-}
-
-recognition.onresult = (event) => {
-    // Clear silence timer on ANY result (interim or final)
-    if (silenceTimer) clearTimeout(silenceTimer);
-
-    let interimTranscript = '';
-
-    // Accumulate results
-    for (let i = event.resultIndex; i < event.results.length; ++i) {
-        if (event.results[i].isFinal) {
-            transcriptBuffer += event.results[i][0].transcript + ' ';
-        } else {
-            interimTranscript += event.results[i][0].transcript;
-        }
-    }
-
-    // Global capture for submitVoiceInput to use
-    latestInterim = interimTranscript;
-
-    // UI Feedback
-    if (interimTranscript) {
-        statusText.textContent = `Hearing: "${interimTranscript}..."`;
-        statusText.style.color = "var(--primary-color)";
-    } else if (transcriptBuffer) {
-        statusText.textContent = "Listening... (Pause to finish)";
-    }
-
-    // --- VAD LOGIC ---
-    // Restart Silence Timer
-    // Only if we actually have *something* captured (interim or final buffer)
-    if (transcriptBuffer.trim() || interimTranscript.trim()) {
-        silenceTimer = setTimeout(() => {
-            console.log("VAD: Silence detected. Sending...");
-            submitVoiceInput();
-        }, SILENCE_TIMEOUT);
-    }
-};
-
-recognition.onerror = (event) => {
-    console.warn("Speech recognition error", event.error);
-    if (event.error === 'no-speech') {
-        // Just ignore, stay listening if continuous? 
-        // Or stop? Usually 'no-speech' means no input for a while.
-        // We'll let user try again.
-        isListening = false;
-        micButton.classList.remove('listening');
-        statusText.textContent = "I didn't hear anything. Try again?";
-    } else {
-        isListening = false;
-        micButton.classList.remove('listening');
-        statusText.textContent = "Voice Error. Try again.";
-    }
-};
-
-// Update Mic Button Logic
-if (micButton) {
-    // Remove old listener (conceptually, thoug `replace_file_content` overwrote the block where the listener was connected? 
-    // Wait, the listener was defined earlier in lines 119-139. I am targeting lines 263-312 which is the EVENTS.
-    // I need to make sure I update the CLICK listener too. 
-    // Ah, I am replacing the `recognition` event handlers here. 
-    // The click handler logic creates a dependency on `transcriptBuffer` and `recognition.stop()`.
-    // My new `submitVoiceInput` handles that.
-    // I should probably REWRITE the click handler in a separate tool call or include it here if the chunk allows?
-    // The previous `micButton.addEventListener` content at line 120 calls `recognition.stop()` which triggers `onend`.
-    // With my new `onend` logic, if `isListening` is true, `onend` will call `submitVoiceInput` if there is text.
-    // So the existing click handler is... ALMOST correct.
-    // Existing click handler (Line 120):
-    // if (isListening) { isListening = false; recognition.stop(); if (buffer) ... send ... }
-    //
-    // My new onend:
-    // if (isListening) { ... send ... }
-    //
-    // CONFLICT: If click handler sets isListening=false, then onend sees isListening=false and DOES NOTHING.
-    // This implies the click handler MUST handle the sending if it proactively stops.
-    //
-    // Let's stick to the plan:
-    // Click Handler -> Stop.
-    // VAD -> Stop.
-    //
-    // If Click Handler sets isListening=false, onend is skipped for logic. That's fine.
-    // The Click Handler sends the text.
-    //
-    // What if VAD stops it?
-    // VAD calls `submitVoiceInput`. `submitVoiceInput` sets `isListening=false` then stops.
-    // `onend` fires. Sees `isListening=false`. Does nothing.
-    // This seems safe.
-    //
-    // EXCEPT: The click handler logic in the file (lines 120-138) has its own manual buffer handling.
-    // It's better if they share logic.
-    // For now, I will assume the EXISTING click handler logic is "okay" but might benefit from using `submitVoiceInput`.
-    // BUT I cannot edit lines 120 and 263 in the same `replace_file_content`.
-    // I will use `multi_replace_file_content` to do this cleanly.
 }
 
 
@@ -568,7 +519,7 @@ async function sendMessageToAI(message) {
                         if (row.startsWith('event: ')) {
                             eventType = row.replace('event: ', '').trim();
                         } else if (row.startsWith('data: ')) {
-                            dataContent = row.replace('data: ', '').trim();
+                            dataContent = row.replace('data: ', '');
                         }
                     }
 
@@ -797,118 +748,21 @@ function fallbackToBrowserTTS(text) {
     window.speechSynthesis.speak(utterance);
 }
 
-
+// Basic Formatter Helper (Markdown-lite)
 function formatMessage(text) {
     if (!text) return '';
 
-    // Minimal sanitation while allowing some formatting
-    let formatted = text
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;")
-        .replace(/"/g, "&quot;")
-        .replace(/'/g, "&#039;");
-
     // Bold
-    formatted = formatted.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
+    let formatted = text.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
+
     // Italic
     formatted = formatted.replace(/\*(.*?)\*/g, '<em>$1</em>');
-    // Newlines
+
+    // Links
+    formatted = formatted.replace(/\[(.*?)\]\((.*?)\)/g, '<a href="$2" target="_blank">$1</a>');
+
+    // Newlines to BR
     formatted = formatted.replace(/\n/g, '<br>');
 
     return formatted;
-}
-
-// --- Smooth Scroll-Based Header Behavior for About Page ---
-// Only activate if we are on a scrollable page (like About)
-if (document.querySelector('body.scrollable')) {
-    let lastScrollY = window.scrollY;
-    let ticking = false;
-    const header = document.querySelector('.main-header');
-
-    function updateHeader() {
-        const currentScrollY = window.scrollY;
-
-        // Threshold of 50px to avoid jitter at top
-        if (currentScrollY <= 50) {
-            header.classList.remove('header-hidden');
-            lastScrollY = currentScrollY;
-            ticking = false;
-            return;
-        }
-
-        // Sensitivity threshold
-        if (Math.abs(currentScrollY - lastScrollY) < 10) {
-            ticking = false;
-            return;
-        }
-
-        if (currentScrollY > lastScrollY) {
-            // Scrolling DOWN (Reading deeper) -> Hide Header for immersion
-            header.classList.add('header-hidden');
-        } else {
-            // Scrolling UP (Going back) -> Show Header
-            header.classList.remove('header-hidden');
-        }
-
-        lastScrollY = currentScrollY;
-        ticking = false;
-    }
-
-    window.addEventListener('scroll', () => {
-        if (!ticking) {
-            window.requestAnimationFrame(updateHeader);
-            ticking = true;
-        }
-    });
-}
-
-// --- Mobile-Only Header Scroll Behavior for Index Page ---
-if (chatHistory && !document.querySelector('body.scrollable')) {
-    let lastChatScrollTop = 0;
-    let chatTicking = false;
-    const indexHeader = document.querySelector('.main-header');
-
-    function updateIndexHeader() {
-        // Only active on mobile/tablet (<= 768px matches CSS media query)
-        if (window.innerWidth > 768) {
-            indexHeader.classList.remove('header-hidden');
-            chatTicking = false;
-            return;
-        }
-
-        const currentChatScrollTop = chatHistory.scrollTop;
-
-        // Threshold to avoid jitter at very top
-        if (currentChatScrollTop <= 50) {
-            indexHeader.classList.remove('header-hidden');
-            lastChatScrollTop = currentChatScrollTop;
-            chatTicking = false;
-            return;
-        }
-
-        // Sensitivity threshold
-        if (Math.abs(currentChatScrollTop - lastChatScrollTop) < 10) {
-            chatTicking = false;
-            return;
-        }
-
-        if (currentChatScrollTop > lastChatScrollTop) {
-            // Scrolling DOWN (Swiping Up) -> Hide Header
-            indexHeader.classList.add('header-hidden');
-        } else {
-            // Scrolling UP (Swiping Down) -> Show Header
-            indexHeader.classList.remove('header-hidden');
-        }
-
-        lastChatScrollTop = currentChatScrollTop;
-        chatTicking = false;
-    }
-
-    chatHistory.addEventListener('scroll', () => {
-        if (!chatTicking) {
-            window.requestAnimationFrame(updateIndexHeader);
-            chatTicking = true;
-        }
-    });
 }
