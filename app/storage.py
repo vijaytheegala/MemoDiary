@@ -3,7 +3,7 @@ import json
 import os
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Any
-from functools import lru_cache
+
 
 from contextlib import contextmanager
 
@@ -57,8 +57,8 @@ class DiaryStorage:
                 )
             ''')
             
-            # Create indexes for performance
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_entries_session_timestamp ON entries(session_id, timestamp)')
+            # Redundant index removed
+
             
             # Check if session_id column exists
             cursor.execute("PRAGMA table_info(entries)")

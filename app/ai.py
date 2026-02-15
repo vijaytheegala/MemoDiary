@@ -97,7 +97,17 @@ PRIVACY & DATA ISOLATION (STRICT):
 CORE LOGIC & FALLBACKS (CRITICAL):
 1. **CHECK CONTEXT FIRST**: Read the "RELEVANT DIARY ENTRIES" section below.
    - If it contains the answer (or relevant info), USE IT. Cite it naturally (e.g., "You mentioned that...").
-   - **EXPLICIT RECALL REQUIRED**: When the user asks a specific memory question (e.g., "What is my dog's name?", "Do you remember my project?"), you MUST explicitly state the recalled information in your answer (e.g., "Your dog's name is Coco"). NEVER give a vague confirmation like "Yes, I remember" without providing the actual details.
+   - **EXPLICIT RECALL REQUIRED**: When the user asks a specific memory question (e.g., "What is my dog's name?"), you MUST explicitly state the recalled information.
+
+2. **WORLD / GENERAL KNOWLEDGE**: 
+   - If the user asks about general topics (News, Definitions, Cities, Events) or Trivial things, **ANSWER DIRECTLY**.
+   - **DO NOT** say "I don't have this in your records".
+   - **DO NOT** ask "Would you like me to look this up?".
+   - **JUST ANSWER**. You are intelligent. Use your own knowledge constraints (Gemini).
+
+3. **PERSONAL / MEMORY GAPS**:
+   - ONLY if the question is explicitly PERSONAL (e.g. "What did I do yesterday?") AND no context is found:
+   - Then say: "I don't have a record of that."
    
 2. **SHORT-TERM CONVERSATIONAL CONTEXT**:
    - Pay close attention to the `Recent Conversation History` (the sequence of messages above).
@@ -328,34 +338,62 @@ async def handle_onboarding(session_id: str, user: Dict, user_input: str) -> Tup
 
     return None, None
 
-async def get_ai_response(session_id: str, history: List[Dict], user_input: str, stream: bool = False) -> any:
+async def get_ai_response(session_id: str, history: List[Dict], user_input: str, stream: bool = False, fast_intent: str = None) -> any:
     # If stream=True, returns an async generator (Iterator[str])
     # If stream=False, returns Tuple[str, str] (text, mood)
     
     try:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        # 1. Analyze query first (We need intent/language for storage)
-        analysis = await query_engine.analyze_query(user_input, now)
-        language_code = analysis.get("language_code", "en")
-        intent = analysis.get("intent", "chat")
+        # 0. Store user message immediately (ALWAYS)
+        # We need language code, but for fast path we default to 'en'
+        language_code = "en" 
         
-        # 2. Store user message immediately (ALWAYS)
+        # LOGIC BRANCHING BASED ON FAST INTENT
+        analysis = {}
+        context_section = ""
+        is_sensitive = False
+        intent = fast_intent if fast_intent else "chat"
+
+        # DECIDE: Use Deep Memory?
+        should_use_deep_memory = (fast_intent == "personal" or fast_intent is None)
+
+        if should_use_deep_memory:
+            # 1. Analyze Query via LLM (Deep)
+            analysis = await query_engine.analyze_query(user_input, now)
+            language_code = analysis.get("language_code", "en")
+            intent = analysis.get("intent", "chat")
+            is_sensitive = analysis.get("is_sensitive", False)
+            
+            # 2. Retrieve Context (Deep)
+            if intent != "general_knowledge":
+                 context = query_engine.retrieve_context(session_id, analysis)
+                 if context: context_section += context
+                 
+        else:
+            # FAST PATH (World / General / Trivial)
+            safe_print(f"[FAST PATH] Skipping Memory/Analysis for Intent: {intent}")
+            if intent == "world":
+                 context_section += "SYSTEM NOTE: User is asking about WORLD/EXTERNAL info. Answer DIRECTLY and FACTUALLY. Do NOT check memory. Do NOT ask permission.\n"
+            elif intent == "general":
+                 context_section += "SYSTEM NOTE: General casual conversation. Do NOT check memory.\n"
+
+        # 3. Store User Entry (Now that we have language code)
         entry_id = storage.add_entry(session_id, "user", user_input, language_code=language_code)
         
-        # 3. GLOBAL EXTRACTION: Process CURRENT message for every request
-        # The Memory Processor will filter out irrelevant info (empty facts).
+        # 4. Background Learning (Even for world queries, we might want to learn interest?)
+        # Let's keep it for all to build distinct user profile
         asyncio.create_task(memory_processor.process_entry(session_id, user_input, entry_id))
         
-        # 4. Check Onboarding
+        # 5. Check Onboarding
         user = storage.get_user(session_id)
         
         # Handle onboarding (Not streamed for simplicity/stability)
-        if not user or not user.get("onboarding_complete"):
+        # SKIP for World/General/Trivial to allow quick answers
+        if (fast_intent not in ["world", "general", "trivial"]) and (not user or not user.get("onboarding_complete")):
             onboarding_res, onboarding_mood = await handle_onboarding(session_id, user, user_input)
             if onboarding_res:
                 if stream: 
-                    # For streaming requests during onboarding, just yield the full text at once
                     async def onboarding_stream():
                         yield onboarding_res
                     return onboarding_stream()
@@ -364,25 +402,24 @@ async def get_ai_response(session_id: str, history: List[Dict], user_input: str,
         
         # --- Standard MemoDiary Flow ---
         
-        # 5. Additional Memory Hygiene (Confirmation Logic)
-        is_sensitive = analysis.get("is_sensitive", False)
-        
-        # Confirmation Logic (Special Case: Process PREVIOUS message)
-        if intent == "confirmation":
-            if len(history) >= 2:
-                last_user_msg = history[-2]
-                if last_user_msg.get('role') == 'user':
-                    parts = last_user_msg.get('parts', [])
-                    if parts:
-                        part = parts[0]
-                        prev_text = part.get('text', '') if isinstance(part, dict) else getattr(part, 'text', '')
-                        if prev_text:
-                            asyncio.create_task(memory_processor.process_entry(session_id, prev_text, entry_id))
+        # 6. Additional Memory Hygiene (Confirmation Logic - Only for Deep Path / Personal)
+        if should_use_deep_memory:
+            # Confirmation Logic (Special Case: Process PREVIOUS message)
+            if intent == "confirmation":
+                if len(history) >= 2:
+                    last_user_msg = history[-2]
+                    if last_user_msg.get('role') == 'user':
+                        # Fix: Handle both dictionary and object access if history structure varies
+                        content = last_user_msg.get('content', '')
+                        if not content and 'parts' in last_user_msg:
+                             parts = last_user_msg.get('parts', [])
+                             if parts:
+                                 part = parts[0]
+                                 content = part.get('text', '') if isinstance(part, dict) else getattr(part, 'text', '')
+                        
+                        if content:
+                            asyncio.create_task(memory_processor.process_entry(session_id, content, entry_id))
 
-
-        # 4. Context Retrival
-        context_section = ""
-        context = ""
         
         # INJECT REASONING
         reasoning = analysis.get("reasoning", "")
@@ -398,15 +435,7 @@ async def get_ai_response(session_id: str, history: List[Dict], user_input: str,
         if context:
             context_section += context
 
-        if intent == "mixed":
-            mixed_instruction = (
-                f"\nSYSTEM NOTE: This is a MIXED query. \n"
-                f"1. GENERAL PART: '{analysis.get('general_query')}' -> Answer this using your general knowledge.\n"
-                f"2. PERSONAL PART: Use the RELEVANT DIARY ENTRIES above (if any) to answer contextually.\n"
-                f"3. Merge them clearly."
-            )
-            context_section += mixed_instruction
-        elif is_sensitive:
+        if is_sensitive:
             sensitive_instruction = (
                 "\nSYSTEM NOTE: The user mentioned a SENSITIVE/IMPORTANT event (Health, Accident, Interview, etc.). "
                 "You have NOT saved this to long-term memory yet. "
@@ -416,6 +445,7 @@ async def get_ai_response(session_id: str, history: List[Dict], user_input: str,
         elif intent == "personal_fact" and not context:
             context_section += "\nSYSTEM NOTE: No specific diary entries found for this query. The user is asking about a PERSONAL memory. Since you have no record, you MUST output something like: 'I don't have a record of that yet.' or 'I don't recall that.' DO NOT HALLUCINATE or guess."
         elif intent == "general_knowledge":
+
             context_section += "\nSYSTEM NOTE: This is a GENERAL KNOWLEDGE / WORLD INFO query. Do NOT use personal memory. Answer using your own knowledge. AFTER answering, if the topic is about news, public events, or something potentially signficant, SOFTLY ASK: 'Would you like me to save this or connect it to something personal?'"
 
         # 5. Prompt Construction

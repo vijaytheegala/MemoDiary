@@ -27,6 +27,19 @@ function saveChatHistory() {
     }
 }
 
+// --- BASIC SANITIZER ---
+function sanitizeHTML(str) {
+    if (!str) return '';
+    return str.replace(/[&<>'"]/g, 
+        tag => ({
+            '&': '&amp;',
+            '<': '&lt;',
+            '>': '&gt;',
+            "'": '&#39;',
+            '"': '&quot;'
+        }[tag]));
+}
+
 // Global retry function
 window.retryLastMessage = function () {
     const btn = document.getElementById('retry-btn-active');
@@ -320,7 +333,7 @@ async function initApp() {
 
         // Update Session ID
         sessionId = data.session_id;
-        localStorage.setItem('memodiary_user_id', sessionId);
+        localStorage.setItem('memodiary_user_id', sessionId); // FIXED: Consistent key name
 
         // Display Welcome Message
         addMessageToUI('ai', data.message);
@@ -374,14 +387,27 @@ function addMessageToUI(role, text, save = true) {
 
     const bubble = document.createElement('div');
     bubble.classList.add('bubble');
-    bubble.innerHTML = formatMessage(text); // Basic formatting
+    
+    // IMPORTANT: Sanitize ALL inputs, but allow our internal formatting to run AFTER hooks
+    // BUT our formatMessage() inserts HTML tags!
+    // Strategy: Sanitize raw text first, THEN format using safe replacement.
+    // However, formatMessage does replace(..., <strong>...</strong>).
+    // So we should format THEN sanitize? No, that kills tags.
+    // Correct approach: Sanitize the INPUT text content, then run formatMessage which adds SPECIFIC safe tags.
+    
+    // Actually, formatMessage takes raw text. 
+    // If raw text has <script>, formatMessage returns <script> unchanged (except newlines).
+    // So we must sanitize `text` first.
+    
+    const safeText = sanitizeHTML(text);
+    bubble.innerHTML = formatMessage(safeText); 
 
     messageDiv.appendChild(bubble);
     chatHistory.appendChild(messageDiv);
 
     // Persist to Session Storage
     if (save) {
-        chatMessages.push({ role, text });
+        chatMessages.push({ role, text }); // Save RAW text (to re-render correctly later)
         saveChatHistory();
     }
 
@@ -527,9 +553,15 @@ async function sendMessageToAI(message) {
                         if (dataContent) {
                             console.log("New Session ID received:", dataContent);
                             sessionId = dataContent;
-                            localStorage.setItem('memo_session_id', sessionId);
+                            localStorage.setItem('memodiary_user_id', sessionId); // FIXED KEY
                         }
                         continue;
+                    }
+                    
+                    if (eventType === 'mood') {
+                         console.log("Details mood:", dataContent);
+                         updateMood(dataContent);
+                         continue;
                     }
 
                     if (dataContent === '[DONE]') continue;
@@ -539,7 +571,8 @@ async function sendMessageToAI(message) {
 
                     // Update UI seamlessly
                     if (bubbleContent) {
-                        bubbleContent.innerHTML = formatMessage(aiFullText);
+                        const safeFullText = sanitizeHTML(aiFullText);
+                        bubbleContent.innerHTML = formatMessage(safeFullText);
                     }
 
                     // --- TTS Streaming Logic ---

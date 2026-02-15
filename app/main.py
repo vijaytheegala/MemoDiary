@@ -5,21 +5,19 @@ from fastapi import FastAPI, HTTPException, Request, UploadFile, File
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-import uuid
+import logging
 import os
 import secrets
-import string
-import logging
-import traceback
-import io
 
-from app.session import get_session_history, add_message_to_session
+
+from app.session import get_session_history
+
 from app.ai import get_ai_response
 from app.utils.tts_engine import tts_engine
 from app.transcriber import transcriber
 from app.middleware.rate_limiter import chat_limiter # Restored import
 from fastapi.responses import FileResponse, StreamingResponse
-from pydantic import BaseModel, Field
+
 
 
 from logging.handlers import RotatingFileHandler
@@ -136,12 +134,28 @@ async def chat(request: Request, chat_req: ChatRequest):
         # 3. Stream or Block
         if chat_req.stream:
             async def event_generator():
+                # 0. FAST ROUTING (Pre-LLM)
+                from app.query import fast_intent_check, QueryRouting
+                fast_route = fast_intent_check(user_message)
+                fast_intent = fast_route.get("intent")
+                fast_payload = fast_route.get("payload")
+
+                logger.info(f"Fast Router: {fast_intent} (Payload: {fast_payload})")
+
+                # CASE A: TRIVIAL (Math request with direct answer)
+                if fast_intent == QueryRouting.TRIVIAL and fast_payload:
+                     # Simulate streaming for consistent frontend experience
+                     yield f"data: {fast_payload}\n\n"
+                     yield "event: mood\ndata: ⚡\n\n"
+                     yield "event: done\ndata: [DONE]\n\n"
+                     return
+
                 # Send Session ID first if new
                 if new_id_generated:
                     yield f"event: session_id\ndata: {new_id_generated}\n\n"
                 
-                # Get the stream generator from AI
-                ai_stream = await get_ai_response(session_id, history, user_message, stream=True)
+                # Get the stream generator from AI (Pass fast_intent)
+                ai_stream = await get_ai_response(session_id, history, user_message, stream=True, fast_intent=fast_intent)
                 
                 full_response = ""
                 async for chunk in ai_stream:
@@ -156,6 +170,9 @@ async def chat(request: Request, chat_req: ChatRequest):
                 # REMOVED: Delegate to app/ai.py
                 # if full_response:
                 #    add_message_to_session(session_id, "assistant", full_response)
+                
+                # Send Mood event
+                yield "event: mood\ndata: 😌\n\n"
                 
                 # Send 'done' event? or close.
                 yield "event: done\ndata: [DONE]\n\n"
@@ -280,9 +297,10 @@ async def transcribe_endpoint(file: UploadFile = File(...)):
 
 # --- ADMIN PANEL ---
 
-# Secure constants (PIN: 148314)
-ADMIN_SALT_HEX = "7d808147a534abdcd708343e801868e7"
-ADMIN_PIN_HASH_HEX = "8d2c5f5d5458e6c44d208a4df2665419b483bacbd4312815c99c4b26aca624cf"
+# Secure constants (Loaded from ENV with safe defaults for dev)
+ADMIN_SALT_HEX = os.getenv("ADMIN_SALT_HEX", "7d808147a534abdcd708343e801868e7")
+ADMIN_PIN_HASH_HEX = os.getenv("ADMIN_PIN_HASH_HEX", "8d2c5f5d5458e6c44d208a4df2665419b483bacbd4312815c99c4b26aca624cf")
+
 
 # In-memory admin session store
 ACTIVE_ADMIN_TOKENS = set()

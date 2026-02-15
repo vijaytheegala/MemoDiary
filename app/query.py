@@ -60,6 +60,72 @@ Input: "Do you remember the project details I mentioned earlier?"
 Output: { "intent": "personal_fact", "memory_keys": ["project", "project_details"], "reasoning": "User asks for specific topic memory", "is_sensitive": false }
 """
 
+
+import re
+
+class QueryRouting:
+    TRIVIAL = "trivial"
+    WORLD = "world"
+    GENERAL = "general"
+    PERSONAL = "personal"
+
+def fast_intent_check(text: str) -> dict:
+    """
+    Ultra-fast rule-based router (Regex/Keyword).
+    Returns: { "intent": "trivial|world|general|personal", "payload": ... }
+    """
+    text = text.strip()
+    text_lower = text.lower()
+    
+    # 1. TRIVIAL: Math
+    # Simple arithmetic: 2 + 2, 5*10, 100/4
+    # Regex allows spaces
+    math_match = re.match(r'^(\d+)\s*([\+\-\*\/])\s*(\d+)$', text)
+    if math_match:
+        try:
+            n1 = float(math_match.group(1))
+            op = math_match.group(2)
+            n2 = float(math_match.group(3))
+            res = 0
+            if op == '+': res = n1 + n2
+            elif op == '-': res = n1 - n2
+            elif op == '*': res = n1 * n2
+            elif op == '/': res = n1 / n2 if n2 != 0 else "undefined"
+            
+            # Format nicely
+            if isinstance(res, float) and res.is_integer():
+                res = int(res)
+            return {"intent": QueryRouting.TRIVIAL, "payload": str(res)}
+        except:
+            pass
+
+    # 2. TRIVIAL: Greetings (Simple) - return empty payload implies "let AI handle quickly" 
+    if text_lower in ["hi", "hello", "hey", "test", "ping"]:
+        return {"intent": QueryRouting.TRIVIAL, "payload": None}
+
+    # 3. PERSONAL: Keywords
+    personal_keywords = [
+        r"\bmy\b", r"\bme\b", r"\bi\b", r"\bi'm\b", r"\bremember\b", r"\brecall\b", 
+        r"\byesterday\b", r"\blast\s+(week|month|year|night)\b", r"\bwe\b", r"\bour\b",
+        r"\bdiary\b", r"\bentry\b", r"\bnote\b"
+    ]
+    for pk in personal_keywords:
+        if re.search(pk, text_lower):
+            return {"intent": QueryRouting.PERSONAL}
+
+    # 4. WORLD: Keywords
+    world_keywords = [
+        r"\bwho\s+is\b", r"\bwhat\s+is\b", r"\bwhere\s+is\b", 
+        r"\bnews\b", r"\bweather\b", r"\bevent(s)?\b", r"\bcapital\b",
+        r"\bpopulation\b", r"\bpresident\b", r"\bmeaning\b", r"\bdefine\b"
+    ]
+    for wk in world_keywords:
+        if re.search(wk, text_lower):
+            return {"intent": QueryRouting.WORLD}
+
+    # 5. GENERAL: Fallback
+    return {"intent": QueryRouting.GENERAL}
+
 class QueryEngine:
     def __init__(self):
         pass
