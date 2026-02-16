@@ -30,7 +30,7 @@ function saveChatHistory() {
 // --- BASIC SANITIZER ---
 function sanitizeHTML(str) {
     if (!str) return '';
-    return str.replace(/[&<>'"]/g, 
+    return str.replace(/[&<>'"]/g,
         tag => ({
             '&': '&amp;',
             '<': '&lt;',
@@ -387,20 +387,20 @@ function addMessageToUI(role, text, save = true) {
 
     const bubble = document.createElement('div');
     bubble.classList.add('bubble');
-    
+
     // IMPORTANT: Sanitize ALL inputs, but allow our internal formatting to run AFTER hooks
     // BUT our formatMessage() inserts HTML tags!
     // Strategy: Sanitize raw text first, THEN format using safe replacement.
     // However, formatMessage does replace(..., <strong>...</strong>).
     // So we should format THEN sanitize? No, that kills tags.
     // Correct approach: Sanitize the INPUT text content, then run formatMessage which adds SPECIFIC safe tags.
-    
+
     // Actually, formatMessage takes raw text. 
     // If raw text has <script>, formatMessage returns <script> unchanged (except newlines).
     // So we must sanitize `text` first.
-    
+
     const safeText = sanitizeHTML(text);
-    bubble.innerHTML = formatMessage(safeText); 
+    bubble.innerHTML = formatMessage(safeText);
 
     messageDiv.appendChild(bubble);
     chatHistory.appendChild(messageDiv);
@@ -557,17 +557,26 @@ async function sendMessageToAI(message) {
                         }
                         continue;
                     }
-                    
+
                     if (eventType === 'mood') {
-                         console.log("Details mood:", dataContent);
-                         updateMood(dataContent);
-                         continue;
+                        console.log("Details mood:", dataContent);
+                        updateMood(dataContent);
+                        continue;
                     }
 
                     if (dataContent === '[DONE]') continue;
                     if (!dataContent) continue;
 
-                    aiFullText += dataContent;
+                    // Support JSON-encoded text for better newline handling
+                    let textChunk = dataContent;
+                    try {
+                        const json = JSON.parse(dataContent);
+                        if (json.text) textChunk = json.text;
+                    } catch (e) {
+                        // Fallback to plain text if not JSON
+                    }
+
+                    aiFullText += textChunk;
 
                     // Update UI seamlessly
                     if (bubbleContent) {
@@ -577,7 +586,7 @@ async function sendMessageToAI(message) {
 
                     // --- TTS Streaming Logic ---
                     if (!isMuted) {
-                        sentenceBuffer += dataContent;
+                        sentenceBuffer += textChunk;
                         // Check for sentence delimiters (. ? ! ) allow quotes ".'
                         const match = sentenceBuffer.match(/([^\.!\?]+[\.!\?]+)\s/);
 

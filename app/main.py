@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import logging
 import os
+import json
 import secrets
 
 
@@ -145,7 +146,8 @@ async def chat(request: Request, chat_req: ChatRequest):
                 # CASE A: TRIVIAL (Math request with direct answer)
                 if fast_intent == QueryRouting.TRIVIAL and fast_payload:
                      # Simulate streaming for consistent frontend experience
-                     yield f"data: {fast_payload}\n\n"
+                     payload = json.dumps({"text": fast_payload})
+                     yield f"data: {payload}\n\n"
                      yield "event: mood\ndata: ⚡\n\n"
                      yield "event: done\ndata: [DONE]\n\n"
                      return
@@ -161,10 +163,9 @@ async def chat(request: Request, chat_req: ChatRequest):
                 async for chunk in ai_stream:
                     if chunk:
                         full_response += chunk
-                        # Escape newlines for SSE data payload logic if needed, 
-                        # but standard event stream handles it if we are careful.
-                        # Using JSON data payload is safer.
-                        yield f"data: {chunk}\n\n"
+                        # JSON Encode to handle newlines/special chars safely
+                        payload = json.dumps({"text": chunk})
+                        yield f"data: {payload}\n\n"
                 
                 # Update Session History with full response
                 # REMOVED: Delegate to app/ai.py

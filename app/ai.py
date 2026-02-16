@@ -426,6 +426,7 @@ async def get_ai_response(session_id: str, history: List[Dict], user_input: str,
         if reasoning:
             context_section += f"SYSTEM REASONING: {reasoning}\n\n"
 
+        context = ""
         if intent != "general_knowledge":
              context = query_engine.retrieve_context(
                 session_id, 
@@ -487,14 +488,42 @@ async def get_ai_response(session_id: str, history: List[Dict], user_input: str,
             # --- STREAMING HANDLING (Inner Generator) ---
             async def response_streamer():
                 full_text = ""
+                delay = 1
+                
+                # Retry Loop for Connection
+                stream_resp = None
+                for attempt in range(MAX_RETRIES + 1):
+                    try:
+                        global client
+                        if not client: client = get_client()
+                        if not client: raise ValueError("No Client Available")
+
+                        stream_resp = await client.aio.models.generate_content_stream(
+                            model="gemini-2.0-flash", 
+                            contents=contents,
+                            config=config
+                        )
+                        break # Connection Successful
+
+                    except Exception as e:
+                        err_str = str(e)
+                        if "429" in err_str or "503" in err_str:
+                            if attempt < MAX_RETRIES:
+                                safe_print(f"[STREAM] Rate Limit/Error ({'429' if '429' in err_str else '503'}). Retrying in {delay}s...")
+                                await asyncio.sleep(delay)
+                                delay *= 2
+                                # Rotate Key
+                                client = get_client()
+                                continue
+                        
+                        # Non-retryable or retries exhausted
+                        safe_print(f"Stream Connection Error: {e}")
+                        yield f"[ERR: {str(e)}]"
+                        return
+
+                if not stream_resp: return
+
                 try:
-                    # Retry logic isn't easily wrapped around stream, simplistic approach for MVP
-                    stream_resp = await client.aio.models.generate_content_stream(
-                        model="gemini-2.0-flash", 
-                        contents=contents,
-                        config=config
-                    )
-                    
                     async for chunk in stream_resp:
                         if chunk.text:
                             full_text += chunk.text
@@ -505,7 +534,7 @@ async def get_ai_response(session_id: str, history: List[Dict], user_input: str,
                         storage.add_entry(session_id, "model", full_text)
                         
                 except Exception as e:
-                    safe_print(f"Stream Error: {e}")
+                    safe_print(f"Stream Chunk Error: {e}")
                     yield f"[ERR: {str(e)}]"
 
             return response_streamer()

@@ -8,7 +8,14 @@ try:
 except:
     pass
 
-BASE_URL = "http://localhost:8000"
+port = 8000
+if len(sys.argv) > 1:
+    try:
+        port = int(sys.argv[1])
+    except ValueError:
+        pass
+
+BASE_URL = f"http://localhost:{port}"
 
 def test_health():
     print(f"Testing Health Check at {BASE_URL}/health...")
@@ -45,7 +52,7 @@ def test_chat(session_id):
         print("\n[SKIP] Skipping Chat Test (No Session ID)")
         return
 
-    print("\nTesting Chat Endpoint...")
+    print("\nTesting Chat Endpoint (Blocking Mode)...")
     try:
         payload = {
             "session_id": session_id,
@@ -56,13 +63,55 @@ def test_chat(session_id):
         if resp.status_code == 200:
             data = resp.json()
             if "response" in data and "mood" in data:
-                print(f"[PASS] Chat Passed (Response: {data['response'][:30]}..., Mood: {data['mood']})")
+                print(f"[PASS] Chat (Blocking) Passed (Response: {data['response'][:30]}..., Mood: {data['mood']})")
             else:
-                print(f"[FAIL] Chat Failed: Invalid Schema {data.keys()}")
+                print(f"[FAIL] Chat (Blocking) Failed: Invalid Schema {data.keys()}")
         else:
-            print(f"[FAIL] Chat Failed: {resp.status_code} - {resp.text}")
+            print(f"[FAIL] Chat (Blocking) Failed: {resp.status_code} - {resp.text}")
     except Exception as e:
-        print(f"[FAIL] Chat Error: {e}")
+        print(f"[FAIL] Chat (Blocking) Error: {e}")
+
+def test_chat_stream(session_id):
+    if not session_id:
+        print("\n[SKIP] Skipping Chat Stream Test (No Session ID)")
+        return
+
+    print("\nTesting Chat Endpoint (Streaming Mode)...")
+    try:
+        payload = {
+            "session_id": session_id,
+            "message": "Write a short poem.",
+            "stream": True 
+        }
+        # Use stream=True in requests to get raw iterable content
+        resp = requests.post(f"{BASE_URL}/api/chat", json=payload, stream=True)
+        
+        if resp.status_code == 200:
+            valid_chunks = 0
+            for line in resp.iter_lines():
+                if line:
+                    decoded_line = line.decode('utf-8')
+                    if decoded_line.startswith("data: "):
+                        content = decoded_line.replace("data: ", "")
+                        if content in ["[DONE]", "⚡", "😌"]: continue
+                        
+                        try:
+                            # CRITICAL: Verify JSON format
+                            header_check = json.loads(content)
+                            if "text" in header_check:
+                                valid_chunks += 1
+                        except json.JSONDecodeError:
+                            print(f"[FAIL] Stream Chunk Not JSON: {content}")
+                            return
+
+            if valid_chunks > 0:
+                print(f"[PASS] Chat (Streaming) Passed. Received {valid_chunks} valid JSON chunks.")
+            else:
+                print("[WARN] Chat (Streaming) received no text chunks (Maybe trivial response?)")
+        else:
+            print(f"[FAIL] Chat (Streaming) Failed: {resp.status_code} - {resp.text}")
+    except Exception as e:
+        print(f"[FAIL] Chat (Streaming) Error: {e}")
 
 def test_admin_login():
     print("\nTesting Admin Login...")
@@ -90,5 +139,6 @@ if __name__ == "__main__":
     test_health()
     sid = test_startup()
     test_chat(sid)
+    test_chat_stream(sid)
     test_admin_login()
     print("\n=== DONE ===")

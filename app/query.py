@@ -136,9 +136,12 @@ class QueryEngine:
             return genai.Client(api_key=key, http_options={'api_version': 'v1beta'})
         return None
 
+    MAX_RETRIES = 3
+
     async def analyze_query(self, text: str, current_time: str) -> Dict[str, Any]:
         """
         Determine if query needs context retrieval.
+        Includes retry logic for 429/503 errors.
         """
         full_prompt = f"Current Time: {current_time}\nInput: {text}"
         
@@ -150,30 +153,41 @@ class QueryEngine:
              safe_print(f"[FAST PATH] Greeting detected: '{text}' -> Skipping Analysis LLM")
              return {"intent": "chat", "language_code": "en", "is_sensitive": False}
 
-        client = self._get_client()
-        if not client:
-            return {"intent": "emotional_recall", "language_code": "en", "is_sensitive": False}
+        delay = 1
+        for attempt in range(self.MAX_RETRIES + 1):
+            client = self._get_client()
+            if not client:
+                return {"intent": "emotional_recall", "language_code": "en", "is_sensitive": False}
 
-        try:
-            # UPGRADE: Use Flash-Lite/Flash for latency
-            response = await client.aio.models.generate_content(
-                model="gemini-2.0-flash-lite-preview-02-05", 
-                contents=full_prompt,
-                config=types.GenerateContentConfig(
-                    system_instruction=QUERY_ANALYSIS_PROMPT,
-                    response_mime_type="application/json",
-                    temperature=0.0
+            try:
+                # UPGRADE: Use Flash-Lite/Flash for latency
+                response = await client.aio.models.generate_content(
+                    model="gemini-2.0-flash", 
+                    contents=full_prompt,
+                    config=types.GenerateContentConfig(
+                        system_instruction=QUERY_ANALYSIS_PROMPT,
+                        response_mime_type="application/json",
+                        temperature=0.0
+                    )
                 )
-            )
-            
-            text_res = response.text.strip()
-            import json
-            data = json.loads(text_res)
-            return data
-        except Exception as e:
-            safe_print(f"Query Analysis Error: {e}")
-            # Fallback
-            return {"intent": "emotional_recall", "language_code": "en", "is_sensitive": False}
+                
+                text_res = response.text.strip()
+                import json
+                data = json.loads(text_res)
+                return data
+
+            except Exception as e:
+                err_str = str(e)
+                if "429" in err_str or "503" in err_str:
+                    if attempt < self.MAX_RETRIES:
+                        safe_print(f"[QUERY] Rate Limit/Error ({'429' if '429' in err_str else '503'}). Retrying in {delay}s...")
+                        await asyncio.sleep(delay)
+                        delay *= 2
+                        continue
+                
+                safe_print(f"Query Analysis Error: {e}")
+                # Fallback only on final failure or non-retryable error
+                return {"intent": "emotional_recall", "language_code": "en", "is_sensitive": False}
 
     def retrieve_context(self, session_id: str, analysis: Dict[str, Any]) -> str:
         """
@@ -198,6 +212,7 @@ class QueryEngine:
              
              # 3. Fetch Memory Fragments
              keys = analysis.get("memory_keys", [])
+             found_facts = []
              if keys:
                  # NORMALIZATION: Snake case for better matching
                  normalized_keys = []
@@ -224,9 +239,26 @@ class QueryEngine:
                              continue
                              
                          context_str += f"- {f['memory_key']}: {f['memory_value']} (Confidence: {f['confidence']})\n"
-                 else:
-                     if not (profile_name or profile_age):
-                        context_str += "No specific personal facts found for this query.\n"
+             
+             # 4. FALLBACK: Check Daily Summary & Raw Search if no structured facts
+             if not found_facts:
+                 context_str += "No specific structured facts found. Checking daily summary...\n"
+                 today = datetime.now().strftime("%Y-%m-%d")
+                 summary = storage.get_daily_summary(session_id, today)
+                 if summary:
+                    context_str += f"TODAY'S SUMMARY ({today}): {summary['summary']}\n"
+                 
+                 # If keys exist, do a raw search on them
+                 if keys:
+                     context_str += "RAW ENTRY SEARCH:\n"
+                     for k in keys:
+                         entries = storage.search_entries(session_id, query=k, limit=3)
+                         for e in entries:
+                             context_str += f"- [{e['timestamp']}] {e['text']}\n"
+
+             # 5. CRITICAL: ALWAYS INCLUDE RECENT CONTEXT (Short-term memory)
+             recent_text = storage.get_recent_context(session_id, limit=10)
+             context_str += f"\nRECENT CONVERSATION (Short-Term Memory):\n{recent_text}\n"
 
         # ROUTE 2: Date Recall -> Query Multi-Level Summaries
         elif intent == "date_recall":
