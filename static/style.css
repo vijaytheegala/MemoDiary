@@ -579,11 +579,14 @@ body:not(.scrollable) {
 /* --- About Page Specifics --- */
 .content-area {
     max-width: 800px;
+    width: 100%;
     margin: 40px auto;
     display: flex;
     flex-direction: column;
     gap: 30px;
-    padding-bottom: 60px;
+    padding: 0 24px 60px;
+    /* added side padding */
+    box-sizing: border-box;
 }
 
 .about-section {
@@ -914,7 +917,8 @@ body:not(.scrollable) {
 
 /* Testimonials Section */
 .testimonials-section {
-    margin-top: 60px;
+    margin-top: 30px;
+    /* Reduced from 60px */
     overflow: hidden;
     padding-bottom: 20px;
     position: relative;
