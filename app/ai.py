@@ -17,77 +17,27 @@ from app.key_manager import key_manager
 env_path = Path(__file__).parent.parent / ".env"
 load_dotenv(dotenv_path=env_path)
 
-# api_key = os.getenv("GEMINI_API_KEY") # Deprecated
-client = None
-def safe_print(text: str):
-    """Utility to print UTF-8 text safely on Windows consoles."""
-    try:
-        print(text)
-    except UnicodeEncodeError:
-        print(text.encode('ascii', 'replace').decode('ascii'))
-
-def get_client():
-    """Get a client with a rotated key."""
-    key = key_manager.get_next_key()
-    if key:
-        return genai.Client(api_key=key, http_options={'api_version': 'v1beta'})
-    return None
+from app.utils.ai_utils import generate_with_retry, generate_with_retry_stream, get_client
 
 client = get_client()
 
-MAX_RETRIES = 3
+# MAX_RETRIES moved to ai_utils
 
-async def generate_with_retry(model_name: str, contents: any, config: types.GenerateContentConfig) -> any:
-    """
-    Wraps generate_content with retry logic for 429 errors.
-    Expands backoff: 1s, 2s, 4s...
-    Rotates key on 429.
-    """
-    global client
-    delay = 1
-    
-    for attempt in range(MAX_RETRIES + 1):
-        try:
-            if not client:
-                client = get_client()
-                if not client:
-                     raise ValueError("No Client Available (Keys missing?)")
-
-            return await client.aio.models.generate_content(
-                model=model_name,
-                contents=contents,
-                config=config
-            )
-        except Exception as e:
-            err_str = str(e)
-            # Check for Rate Limit (429) or Service Unavailable (503) which is also transient
-            if "429" in err_str or "503" in err_str:
-                if attempt < MAX_RETRIES:
-                    safe_print(f"[WARNING] API Rate/Server Limit ({'429' if '429' in err_str else '503'}). Retrying in {delay}s... (Attempt {attempt+1}/{MAX_RETRIES})")
-                    await asyncio.sleep(delay)
-                    delay *= 2
-                    
-                    # Rotate Key
-                    new_client = get_client()
-                    if new_client:
-                        client = new_client
-                    continue
-            
-            # If we are here, it's either not a retryable error OR we ran out of retries
-            raise e
 
 MEMODIARY_PROMPT = """
-You are "MEMO", a private, empathetic, and deeply intelligent AI life companion. 
-Your purpose is to listen, remember, and help the user reflect on their life, while also being a capable, engaging conversation partner.
+You are "MEMO", a deeply personal AI companion and best friend.
+Your purpose is to be a supportive, one-on-one conversational partner who truly listens and cares.
+Think of yourself as a close friend sitting in the same room, not a robot or a search engine.
 
 Current Time: {current_time}
 User Name: {user_name} (Age: {user_age})
 
 PERSONALITY & STYLE:
-- BE EMPATHETIC & NUANCED. Keep it natural, warm, and supportive.
-- BE CONTEXT-AWARE. Congratulate achievements, wish birthdays, and offer sincere encouragement.
-- SOUND CALM, SOFT & REFLECTIVE. Use a supportive, gentle tone.
-- BE FLEXIBLE. If the user wants to joke, tell stories, or discuss abstract topics, engage them fully. Do not restrict yourself to only "memory" tasks.
+- **WARM & INTIMATE**: Talk like a real person. Use contractions ("I'm", "It's"), casual phrasing, and genuine emotion.
+- **SUPPORTIVE LISTENER**: Validate feelings first. If the user is down, be there for them. If they are happy, celebrate with them.
+- **NATURAL FLOW**: Don't be robotic or overly formal. Avoid stiff lists unless requested.
+- **SHORT & PUNCHY**: Keep responses concise and conversational (1-3 sentences mostly), unless a long story or explanation is needed.
+- **FLEXIBLE**: You can joke, be serious, tell stories, or just hang out. Match the user's energy.
 
 PRIVACY & DATA ISOLATION (STRICT):
 - YOU MUST NEVER reveal, confirm, guess, search for, or reference ANY other user's identity, data, conversations, IDs, or stored information.
@@ -488,42 +438,18 @@ async def get_ai_response(session_id: str, history: List[Dict], user_input: str,
             # --- STREAMING HANDLING (Inner Generator) ---
             async def response_streamer():
                 full_text = ""
-                delay = 1
                 
-                # Retry Loop for Connection
-                stream_resp = None
-                for attempt in range(MAX_RETRIES + 1):
-                    try:
-                        global client
-                        if not client: client = get_client()
-                        if not client: raise ValueError("No Client Available")
-
-                        stream_resp = await client.aio.models.generate_content_stream(
-                            model="gemini-2.0-flash", 
-                            contents=contents,
-                            config=config
-                        )
-                        break # Connection Successful
-
-                    except Exception as e:
-                        err_str = str(e)
-                        if "429" in err_str or "503" in err_str:
-                            if attempt < MAX_RETRIES:
-                                safe_print(f"[STREAM] Rate Limit/Error ({'429' if '429' in err_str else '503'}). Retrying in {delay}s...")
-                                await asyncio.sleep(delay)
-                                delay *= 2
-                                # Rotate Key
-                                client = get_client()
-                                continue
-                        
-                        # Non-retryable or retries exhausted
-                        safe_print(f"Stream Connection Error: {e}")
-                        yield f"[ERR: {str(e)}]"
-                        return
-
-                if not stream_resp: return
-
                 try:
+                    global client
+                    # Ensure client is fresh/available - though generate_with_retry_stream handles it too, 
+                    # passing explicit client might be needed if we maintain state, but ai_utils handles it.
+                    
+                    stream_resp = await generate_with_retry_stream(
+                        model_name="gemini-2.0-flash", 
+                        contents=contents,
+                        config=config
+                    )
+
                     async for chunk in stream_resp:
                         if chunk.text:
                             full_text += chunk.text
@@ -532,10 +458,12 @@ async def get_ai_response(session_id: str, history: List[Dict], user_input: str,
                     # After completion, save to storage
                     if full_text:
                         storage.add_entry(session_id, "model", full_text)
-                        
+
                 except Exception as e:
-                    safe_print(f"Stream Chunk Error: {e}")
+                    # Non-retryable or retries exhausted
+                    # safe_print(f"Stream Connection Error: {e}") # safe_print removed
                     yield f"[ERR: {str(e)}]"
+                    return
 
             return response_streamer()
 

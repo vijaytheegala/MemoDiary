@@ -1,6 +1,7 @@
 import os
 from google import genai
 from google.genai import types
+from app.utils.ai_utils import generate_with_retry
 from app.key_manager import key_manager
 from dotenv import load_dotenv
 from pathlib import Path
@@ -13,25 +14,19 @@ class Transcriber:
     def __init__(self):
         pass
 
-    def _get_client(self):
-        key = key_manager.get_next_key()
-        if key:
-            return genai.Client(api_key=key, http_options={'api_version': 'v1beta'})
-        return None
-
     async def transcribe_audio(self, audio_bytes: bytes, mime_type: str = "audio/webm") -> str:
         """
         Transcribes audio bytes using Gemini 2.0 Flash.
         """
-        client = self._get_client()
-        if not client:
-            raise ValueError("No API Key available")
+        # Client generation is handled by generate_with_retry if needed, 
+        # or we could pass one. optimize later if needed.
 
         try:
             prompt = "Transcribe the following audio exactly. Return ONLY the spoken text. Do not add any commentary."
             
-            response = await client.aio.models.generate_content(
-                model="gemini-2.0-flash", 
+            # Using shared retry logic
+            response = await generate_with_retry(
+                model_name="gemini-2.0-flash", 
                 contents=[
                     types.Content(
                         role="user",

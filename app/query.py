@@ -126,22 +126,16 @@ def fast_intent_check(text: str) -> dict:
     # 5. GENERAL: Fallback
     return {"intent": QueryRouting.GENERAL}
 
+from app.utils.ai_utils import generate_with_retry
+
 class QueryEngine:
     def __init__(self):
         pass
 
-    def _get_client(self):
-        key = key_manager.get_next_key()
-        if key:
-            return genai.Client(api_key=key, http_options={'api_version': 'v1beta'})
-        return None
-
-    MAX_RETRIES = 3
-
     async def analyze_query(self, text: str, current_time: str) -> Dict[str, Any]:
         """
         Determine if query needs context retrieval.
-        Includes retry logic for 429/503 errors.
+        Includes retry logic via shared utility.
         """
         full_prompt = f"Current Time: {current_time}\nInput: {text}"
         
@@ -153,41 +147,27 @@ class QueryEngine:
              safe_print(f"[FAST PATH] Greeting detected: '{text}' -> Skipping Analysis LLM")
              return {"intent": "chat", "language_code": "en", "is_sensitive": False}
 
-        delay = 1
-        for attempt in range(self.MAX_RETRIES + 1):
-            client = self._get_client()
-            if not client:
-                return {"intent": "emotional_recall", "language_code": "en", "is_sensitive": False}
-
-            try:
-                # UPGRADE: Use Flash-Lite/Flash for latency
-                response = await client.aio.models.generate_content(
-                    model="gemini-2.0-flash", 
-                    contents=full_prompt,
-                    config=types.GenerateContentConfig(
-                        system_instruction=QUERY_ANALYSIS_PROMPT,
-                        response_mime_type="application/json",
-                        temperature=0.0
-                    )
+        try:
+            # UPGRADE: Use Flash-Lite/Flash for latency
+            response = await generate_with_retry(
+                model_name="gemini-2.0-flash", 
+                contents=full_prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=QUERY_ANALYSIS_PROMPT,
+                    response_mime_type="application/json",
+                    temperature=0.0
                 )
-                
-                text_res = response.text.strip()
-                import json
-                data = json.loads(text_res)
-                return data
+            )
+            
+            text_res = response.text.strip()
+            import json
+            data = json.loads(text_res)
+            return data
 
-            except Exception as e:
-                err_str = str(e)
-                if "429" in err_str or "503" in err_str:
-                    if attempt < self.MAX_RETRIES:
-                        safe_print(f"[QUERY] Rate Limit/Error ({'429' if '429' in err_str else '503'}). Retrying in {delay}s...")
-                        await asyncio.sleep(delay)
-                        delay *= 2
-                        continue
-                
-                safe_print(f"Query Analysis Error: {e}")
-                # Fallback only on final failure or non-retryable error
-                return {"intent": "emotional_recall", "language_code": "en", "is_sensitive": False}
+        except Exception as e:
+            safe_print(f"Query Analysis Error: {e}")
+            # Fallback only on final failure or non-retryable error
+            return {"intent": "emotional_recall", "language_code": "en", "is_sensitive": False}
 
     def retrieve_context(self, session_id: str, analysis: Dict[str, Any]) -> str:
         """

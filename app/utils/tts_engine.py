@@ -15,7 +15,8 @@ class TTSEngine:
         """
         Generates a stream of audio bytes from the given text.
         """
-        communicate = edge_tts.Communicate(text, self.voice, rate="+0%", pitch="+0Hz")
+        # Rate -5% for a slightly more relaxed, natural pace
+        communicate = edge_tts.Communicate(text, self.voice, rate="-5%", pitch="+0Hz")
         async for chunk in communicate.stream():
             if chunk["type"] == "audio":
                 yield chunk["data"]
@@ -24,7 +25,7 @@ class TTSEngine:
         """
         Generates an MP3 file from the given text.
         """
-        communicate = edge_tts.Communicate(text, self.voice, rate="+0%", pitch="+0Hz")
+        communicate = edge_tts.Communicate(text, self.voice, rate="-5%", pitch="+0Hz")
         await communicate.save(output_path)
 
 # Initialize a global TTS engine
