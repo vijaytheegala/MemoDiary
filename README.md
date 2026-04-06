@@ -1,6 +1,7 @@
 # MemoDiary V3 - Personal AI Life Companion
 
-A sophisticated, private, and empathetic AI diary that remembers your life, integrated with Google Gemini.
+A sophisticated, private, and empathetic AI diary that remembers your life. MemoDiary is an asynchronous, Single-Page personal companion application I built to tackle the LLM Amnesia problem. It utilizes FastAPI on the backend and pure Vanilla JavaScript on the frontend. The core innovation is its decoupling of live conversational Generation from background Memory Extraction. When a user speaks via the browser's MediaRecorder API, a custom Intent Routing layer filters the query to ensure we aren't wasting LLM tokens or SQLite reads on trivial prompts like math. If it is personal, the backend searches a structured, persistent SQLite 'knowledge graph', injects context, and streams text back to the browser using Server-Sent Events, where JS sequentially maps it onto an async audio queue for Text-To-Speech playback. I built it specifically to maximize low-latency, scalable AI interaction without expensive NoSQL clouds, demonstrating full-stack proficiency from complex prompt engineering down to bare-metal database index optimization."
+
 
 ## 📋 Prerequisites
 
