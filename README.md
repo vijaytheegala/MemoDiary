@@ -45,8 +45,8 @@ A sophisticated, private, and empathetic AI diary that remembers your life. Memo
     # Optional: Secure Admin PIN Hash (Default provided for dev)
     # To generate your own: 
     #   Run python -c "import hashlib, os; salt = os.urandom(16).hex(); pin = '123456'; idx = hashlib.pbkdf2_hmac('sha256', pin.encode(), bytes.fromhex(salt), 100000).hex(); print(f'ADMIN_SALT_HEX={salt}\nADMIN_PIN_HASH_HEX={idx}')"
-    ADMIN_SALT_HEX=7d808147a534abdcd708343e801868e7
-    ADMIN_PIN_HASH_HEX=8d2c5f5d5458e6c44d208a4df2665419b483bacbd4312815c99c4b26aca624cf
+    ADMIN_SALT_HEX=7d808147a534abdcd708343eXXXX
+    ADMIN_PIN_HASH_HEX=8d2c5f5d5458e6c44d208a4df2665419b483bacbd4312815c99c4b26acXXXXX
     ```
     *(Note: The default PIN for the above hash is `148314`)*
 
