@@ -1,7 +1,6 @@
 import os
 import asyncio
-from google import genai
-from google.genai import types
+from groq import AsyncGroq
 from datetime import datetime, timedelta
 from typing import Tuple, List, Dict, Optional
 from dotenv import load_dotenv
@@ -30,51 +29,55 @@ def get_client():
     """Get a client with a rotated key."""
     key = key_manager.get_next_key()
     if key:
-        return genai.Client(api_key=key, http_options={'api_version': 'v1beta'})
+        return AsyncGroq(api_key=key)
     return None
 
 client = get_client()
 
 MAX_RETRIES = 3
 
-async def generate_with_retry(model_name: str, contents: any, config: types.GenerateContentConfig) -> any:
+async def generate_with_retry(model_name: str, contents: any, config: any = None) -> any:
     """
-    Wraps generate_content with retry logic for 429 errors.
-    Expands backoff: 1s, 2s, 4s...
-    Rotates key on 429.
+    Wraps chat completions with retry logic and model fallback for 429 errors.
     """
     global client
     delay = 1
     
-    for attempt in range(MAX_RETRIES + 1):
-        try:
-            if not client:
-                client = get_client()
+    models_to_try = [model_name]
+    if model_name == "llama-3.3-70b-versatile":
+        models_to_try.extend(["llama-3.1-8b-instant", "llama3-8b-8192"])
+        
+    last_error = None
+    
+    for current_model in models_to_try:
+        delay = 1
+        for attempt in range(MAX_RETRIES + 1):
+            try:
                 if not client:
-                     raise ValueError("No Client Available (Keys missing?)")
+                    client = get_client()
+                    if not client:
+                         raise ValueError("No Client Available (Keys missing?)")
 
-            return await client.aio.models.generate_content(
-                model=model_name,
-                contents=contents,
-                config=config
-            )
-        except Exception as e:
-            err_str = str(e)
-            # Check for Rate Limit (429) or Service Unavailable (503) which is also transient
-            if "429" in err_str or "503" in err_str:
-                if attempt < MAX_RETRIES:
-                    safe_print(f"[WARNING] API Rate/Server Limit ({'429' if '429' in err_str else '503'}). Retrying in {delay}s... (Attempt {attempt+1}/{MAX_RETRIES})")
-                    await asyncio.sleep(delay)
-                    delay *= 2
-                    
-                    # Rotate Key
-                    new_client = get_client()
-                    if new_client:
-                        client = new_client
-                    continue
-            
-            # If we are here, it's either not a retryable error OR we ran out of retries
-            raise e
+                kwargs = {"model": current_model, "messages": contents}
+                if config:
+                    kwargs.update(config)
+
+                return await client.chat.completions.create(**kwargs)
+            except Exception as e:
+                last_error = e
+                err_str = str(e)
+                if "429" in err_str or "503" in err_str:
+                    if attempt < MAX_RETRIES:
+                        safe_print(f"[WARNING] API Rate/Server ({'429' if '429' in err_str else '503'}) on {current_model}. Retrying in {delay}s... (Attempt {attempt+1}/{MAX_RETRIES})")
+                        await asyncio.sleep(delay)
+                        delay *= 2
+                        new_client = get_client()
+                        if new_client: client = new_client
+                        continue
+                # If we are here, break attempt loop to try next model or fail
+                break 
+
+    raise last_error or Exception("Failed to generate content with any model.")
 
 MEMODIARY_PROMPT = """
 You are "MEMO", a private, empathetic, and deeply intelligent AI life companion. 
@@ -222,15 +225,15 @@ async def generate_weekly_recap(session_id: str, user_name: str) -> Optional[str
     
     try:
         resp = await generate_with_retry(
-            model_name="gemini-2.0-flash",
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                temperature=0.7
-            )
+            model_name="llama-3.3-70b-versatile",
+            contents=[{"role": "user", "content": prompt}],
+            config={
+                "response_format": {"type": "json_object"},
+                "temperature": 0.7
+            }
         )
         import json
-        data = json.loads(resp.text.strip())
+        data = json.loads(resp.choices[0].message.content.strip())
         summary = data.get("summary", "")
         mood = data.get("dominant_mood", "📅")
         
@@ -277,13 +280,13 @@ async def handle_onboarding(session_id: str, user: Dict, user_input: str) -> Tup
             f"Input: {user_input}"
         )
         try:
-            # Extraction uses gemini-3-pro-preview for high quality
+            # Extraction uses llama-3.3-70b-versatile for high quality
             name_resp = await generate_with_retry(
-                model_name="gemini-2.0-flash", 
-                contents=name_prompt,
-                config=types.GenerateContentConfig(temperature=0.1)
+                model_name="llama-3.3-70b-versatile", 
+                contents=[{"role": "user", "content": name_prompt}],
+                config={"temperature": 0.1}
             )
-            extracted_name = name_resp.text.strip().split('\n')[0].replace(".", "").replace("My name is ", "").replace("Call me ", "").strip()
+            extracted_name = name_resp.choices[0].message.content.strip().split('\n')[0].replace(".", "").replace("My name is ", "").replace("Call me ", "").strip()
             if not extracted_name: extracted_name = "Friend"
         except Exception as e:
             safe_print(f"Name Extraction Error: {e}")
@@ -311,11 +314,11 @@ async def handle_onboarding(session_id: str, user: Dict, user_input: str) -> Tup
         )
         try:
             age_resp = await generate_with_retry(
-                model_name="gemini-2.0-flash",
-                contents=age_prompt,
-                config=types.GenerateContentConfig(temperature=0.1)
+                model_name="llama-3.3-70b-versatile",
+                contents=[{"role": "user", "content": age_prompt}],
+                config={"temperature": 0.1}
             )
-            res_text = age_resp.text.strip()
+            res_text = age_resp.choices[0].message.content.strip()
             import re
             age_match = re.search(r'\d+', res_text)
             extracted_age = age_match.group(0) if age_match else "Unknown"
@@ -456,30 +459,22 @@ async def get_ai_response(session_id: str, history: List[Dict], user_input: str,
             current_time=now,
             context_section=context_section
         )
-        
-        contents = []
+
+        contents = [{"role": "system", "content": processed_system_prompt}]
         for msg in history[-5:]:
             role = msg.get("role")
             content = msg.get("content")
             if role and content and isinstance(content, str) and content.strip():
-                gemini_role = "model" if role == "assistant" else "user"
-                contents.append(types.Content(role=gemini_role, parts=[types.Part.from_text(text=content)]))
-        contents.append(types.Content(role="user", parts=[types.Part.from_text(text=user_input)]))
+                groq_role = role # "assistant" or "user"
+                contents.append({"role": groq_role, "content": content})
+        contents.append({"role": "user", "content": user_input})
 
         # 6. Generation (Stream vs Non-stream)
-        safety_settings = [
-            types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold=types.HarmBlockThreshold.BLOCK_NONE),
-            types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_HARASSMENT, threshold=types.HarmBlockThreshold.BLOCK_NONE),
-            types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold=types.HarmBlockThreshold.BLOCK_NONE),
-            types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold=types.HarmBlockThreshold.BLOCK_NONE),
-        ]
         
-        config = types.GenerateContentConfig(
-            system_instruction=processed_system_prompt,
-            temperature=0.7, # Increased for creativity
-            top_p=0.9,
-            safety_settings=safety_settings
-        )
+        config = {
+            "temperature": 0.7, # Increased for creativity
+            "top_p": 0.9,
+        }
 
         global client
         if not client: client = get_client()
@@ -488,46 +483,62 @@ async def get_ai_response(session_id: str, history: List[Dict], user_input: str,
             # --- STREAMING HANDLING (Inner Generator) ---
             async def response_streamer():
                 full_text = ""
-                delay = 1
                 
                 # Retry Loop for Connection
                 stream_resp = None
-                for attempt in range(MAX_RETRIES + 1):
-                    try:
-                        global client
-                        if not client: client = get_client()
-                        if not client: raise ValueError("No Client Available")
+                last_error = None
+                models_to_try = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "llama3-8b-8192"]
+                
+                for current_model in models_to_try:
+                    delay = 1
+                    for attempt in range(MAX_RETRIES + 1):
+                        try:
+                            global client
+                            if not client: client = get_client()
+                            if not client: raise ValueError("No Client Available")
 
-                        stream_resp = await client.aio.models.generate_content_stream(
-                            model="gemini-2.0-flash", 
-                            contents=contents,
-                            config=config
-                        )
-                        break # Connection Successful
+                            kwargs = {"model": current_model, "messages": contents, "stream": True}
+                            kwargs.update(config)
 
-                    except Exception as e:
-                        err_str = str(e)
-                        if "429" in err_str or "503" in err_str:
-                            if attempt < MAX_RETRIES:
-                                safe_print(f"[STREAM] Rate Limit/Error ({'429' if '429' in err_str else '503'}). Retrying in {delay}s...")
-                                await asyncio.sleep(delay)
-                                delay *= 2
-                                # Rotate Key
-                                client = get_client()
-                                continue
-                        
-                        # Non-retryable or retries exhausted
-                        safe_print(f"Stream Connection Error: {e}")
-                        yield f"[ERR: {str(e)}]"
-                        return
+                            stream_resp = await client.chat.completions.create(**kwargs)
+                            break # Connection Successful
+
+                        except Exception as e:
+                            last_error = e
+                            err_str = str(e)
+                            if "429" in err_str or "503" in err_str:
+                                if attempt < MAX_RETRIES:
+                                    safe_print(f"[STREAM] Rate Limit ({'429' if '429' in err_str else '503'}) on {current_model}. Retrying in {delay}s...")
+                                    await asyncio.sleep(delay)
+                                    delay *= 2
+                                    client = get_client()
+                                    continue
+                            
+                            # Non-retryable or retries exhausted, break inner loop to try next model
+                            break
+                    
+                    if stream_resp:
+                        break # Connected successfully to one model
+
+                if not stream_resp:
+                    safe_print(f"Stream Connection Error all models exhausted: {last_error}")
+                    err_str = str(last_error).upper() if last_error else ""
+                    if "429" in err_str:
+                         yield "I'm experiencing extremely high traffic across all my thought cores right now. Please try again tomorrow, or add more Gemini API keys to bypass the free limits! 🤯"
+                    elif "503" in err_str:
+                         yield "My thoughts are pausing briefly. Let's try again in a moment. 😴"
+                    else:
+                         yield f"\n\n[We encountered a temporary connection issue. Please try again!]"
+                    return
 
                 if not stream_resp: return
 
                 try:
                     async for chunk in stream_resp:
-                        if chunk.text:
-                            full_text += chunk.text
-                            yield chunk.text
+                        chunk_content = chunk.choices[0].delta.content if chunk.choices and chunk.choices[0].delta.content is not None else None
+                        if chunk_content:
+                            full_text += chunk_content
+                            yield chunk_content
                     
                     # After completion, save to storage
                     if full_text:
@@ -535,7 +546,14 @@ async def get_ai_response(session_id: str, history: List[Dict], user_input: str,
                         
                 except Exception as e:
                     safe_print(f"Stream Chunk Error: {e}")
-                    yield f"[ERR: {str(e)}]"
+                    err_str = str(e).upper()
+                    if "429" in err_str:
+                        yield "\n\nI'm thinking a bit too fast and hit a limit. Give me a moment to catch my breath and try again later! 🤯"
+                    elif "503" in err_str:
+                        yield "\n\nMy thoughts are pausing briefly. Let's try again in a moment. 😴"
+                    else:
+                        yield f"\n\n[We encountered a temporary connection issue. Please try again!]"
+
 
             return response_streamer()
 
@@ -543,13 +561,13 @@ async def get_ai_response(session_id: str, history: List[Dict], user_input: str,
             # --- STANDARD NON-STREAMING ---
             try:
                 response = await generate_with_retry(
-                    model_name="gemini-2.0-flash", 
+                    model_name="llama-3.3-70b-versatile", 
                     config=config,
                     contents=contents
                 )
                 
-                if not response.text: raise ValueError("EMPTY_RESPONSE")
-                ai_text = response.text.strip()
+                if not response.choices[0].message.content: raise ValueError("EMPTY_RESPONSE")
+                ai_text = response.choices[0].message.content.strip()
             except Exception as api_err:
                  # ... existing error handling ...
                 err_str = str(api_err).upper()

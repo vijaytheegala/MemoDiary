@@ -18,13 +18,13 @@ class KeyManager:
         
     def _load_keys(self):
         # Load primary key
-        k1 = os.getenv("GEMINI_API_KEY")
+        k1 = os.getenv("GROQ_API_KEY")
         if k1: self.keys.append(k1)
         
-        # Load secondary keys (pattern: GEMINI_API_KEY_2, _3, etc.)
+        # Load secondary keys (pattern: GROQ_API_KEY_2, _3, etc.)
         i = 2
         while True:
-            k = os.getenv(f"GEMINI_API_KEY_{i}")
+            k = os.getenv(f"GROQ_API_KEY_{i}")
             if k:
                 self.keys.append(k)
                 i += 1

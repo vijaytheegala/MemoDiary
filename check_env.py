@@ -10,15 +10,15 @@ else:
     print(f"[OK] .env file found at {env_path.absolute()}")
     load_dotenv(dotenv_path=env_path)
 
-key = os.getenv("GEMINI_API_KEY")
+key = os.getenv("GROQ_API_KEY")
 
 print("\n--- Environment Check ---")
 if key:
-    print(f"[OK] GEMINI_API_KEY is set (Length: {len(key)})")
-    if key.startswith("AIza"):
-        print("   Key format check: Parsable (Starts with AIza)")
+    print(f"[OK] GROQ_API_KEY is set (Length: {len(key)})")
+    if key.startswith("gsk_"):
+        print("   Key format check: Parsable (Starts with gsk_)")
     else:
-        print("   [WARN] Key format warning: Does not start with 'AIza'. Might be invalid.")
+        print("   [WARN] Key format warning: Does not start with 'gsk_'. Might be invalid.")
 else:
-    print("[FAIL] GEMINI_API_KEY is NOT set.")
+    print("[FAIL] GROQ_API_KEY is NOT set.")
     print("   Please create a .env file or export the variable.")

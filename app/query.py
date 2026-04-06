@@ -1,7 +1,6 @@
 import os
 import asyncio
-from google import genai
-from google.genai import types
+from groq import AsyncGroq
 from typing import List, Dict, Any, Tuple
 from app.storage import storage
 from app.key_manager import key_manager
@@ -133,7 +132,7 @@ class QueryEngine:
     def _get_client(self):
         key = key_manager.get_next_key()
         if key:
-            return genai.Client(api_key=key, http_options={'api_version': 'v1beta'})
+            return AsyncGroq(api_key=key)
         return None
 
     MAX_RETRIES = 3
@@ -161,17 +160,17 @@ class QueryEngine:
 
             try:
                 # UPGRADE: Use Flash-Lite/Flash for latency
-                response = await client.aio.models.generate_content(
-                    model="gemini-2.0-flash", 
-                    contents=full_prompt,
-                    config=types.GenerateContentConfig(
-                        system_instruction=QUERY_ANALYSIS_PROMPT,
-                        response_mime_type="application/json",
-                        temperature=0.0
-                    )
+                response = await client.chat.completions.create(
+                    model="llama-3.1-8b-instant", 
+                    messages=[
+                        {"role": "system", "content": QUERY_ANALYSIS_PROMPT},
+                        {"role": "user", "content": full_prompt}
+                    ],
+                    response_format={"type": "json_object"},
+                    temperature=0.0
                 )
                 
-                text_res = response.text.strip()
+                text_res = response.choices[0].message.content.strip()
                 import json
                 data = json.loads(text_res)
                 return data
