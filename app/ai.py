@@ -390,10 +390,19 @@ async def get_ai_response(session_id: str, history: List[Dict], user_input: str,
         
         # 5. Check Onboarding
         user = storage.get_user(session_id)
+        if not user:
+            # Render/Ephemeral Fix: Re-create user if missing from fresh DB
+            storage.create_user(session_id)
+            user = storage.get_user(session_id) or {
+                "session_id": session_id,
+                "name": "Friend",
+                "age": "Unknown",
+                "onboarding_complete": False
+            }
         
         # Handle onboarding (Not streamed for simplicity/stability)
         # SKIP for World/General/Trivial to allow quick answers
-        if (fast_intent not in ["world", "general", "trivial"]) and (not user or not user.get("onboarding_complete")):
+        if (fast_intent not in ["world", "general", "trivial"]) and (not user.get("onboarding_complete")):
             onboarding_res, onboarding_mood = await handle_onboarding(session_id, user, user_input)
             if onboarding_res:
                 if stream: 

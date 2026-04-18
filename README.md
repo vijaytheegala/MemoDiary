@@ -150,5 +150,5 @@ Visit `http://localhost:8000` to meet **Memo**.
 
 ---
 
-Built with ❤️ by [Vijay Kumar Theegala]
+Built with ❤️ by [Your Name/Handle]
 *Demonstrating full-stack proficiency from complex prompt engineering down to bare-metal database index optimization.*

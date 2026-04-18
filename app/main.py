@@ -113,13 +113,18 @@ async def chat(request: Request, chat_req: ChatRequest):
     try:
         new_id_generated = None
         
-        # 0. Generate SECURE ID if missing
+        # 0. Generate SECURE ID if missing or ensure user exists
+        from app.storage import storage
         if not session_id or session_id == "null" or len(session_id) < 5:
             session_id = generate_secure_id()
             new_id_generated = session_id
             logger.info(f"Generated new secure session ID: {session_id}")
-            from app.storage import storage
             storage.create_user(session_id)
+        else:
+            # Returning user with ID - ensure they exist in DB (Render Fix)
+            if not storage.get_user(session_id):
+                logger.info(f"Re-creating user for existing session ID: {session_id}")
+                storage.create_user(session_id)
 
         # 1. Retrieve history
         history = get_session_history(session_id)
